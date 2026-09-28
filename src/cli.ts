@@ -9624,15 +9624,40 @@ async function cmdSend(rest: string[]): Promise<void> {
   // before reading stdin/content/card files and before any TTS, upload, or Lark
   // provider call.  In particular, an explicit destination session is not an
   // escape hatch from the origin sink.
-  const docTarget = originTurnId
-    ? originSession?.docCommentTargets?.[originTurnId]
-    : undefined;
+  const docTarget = (() => {
+    if (originTurnId) return originSession?.docCommentTargets?.[originTurnId];
+    // Stopping a worker removes the PID marker; reattaching a still-running
+    // legacy CLI replaces it with a session-only marker. Its dedicated document
+    // session still has a durable reply destination and a stable session id.
+    // Recover only a single pending target matching that session's fixed anchor;
+    // never guess from a stale env turn, a shared chat, or another destination.
+    // Protected/ledger-backed runners must retain their exact turn authority.
+    if (!originSession || originSession.status !== 'active'
+      || originSession.scope !== 'chat' || !originSession.chatId.startsWith('doc:')
+      || originSession.cliId === 'codex-app' || exactOriginDispatch
+      || isolatedAttestationContext || trustedRelayCtx) return undefined;
+    const pending = Object.entries(originSession.docCommentTargets ?? {});
+    if (pending.length !== 1) return undefined;
+    const [turnId, target] = pending[0];
+    if (!turnId || target.turnId !== turnId || !target.fileToken || !target.commentId) return undefined;
+    if (originSession.chatId !== `doc:${target.fileToken}:${target.commentId}`
+      && originSession.chatId !== `doc:${target.fileToken}`) return undefined;
+    return target;
+  })();
   // Codex App turns are governed exclusively by their exact dispatch ledger:
   // a settled/missing ledger entry must never fall back to mutable session
   // state. Other CLI adapters predate that ledger, so their frozen per-turn
   // docCommentTargets entry remains the authoritative origin sink.
   const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
     || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  // A virtual document anchor is never an IM receive_id. Missing, ambiguous,
+  // stale, or cross-session origin state must fail before any provider effect.
+  if (!isOriginDocCommentTurn
+    && (originSession?.chatId.startsWith('doc:') || s.chatId.startsWith('doc:')
+      || (!originTurnId && Object.keys(originSession?.docCommentTargets ?? {}).length > 0))) {
+    console.error('botmux send refused: cannot resolve the exact document-comment reply target; no chat message was sent');
+    process.exit(2);
+  }
   if (isOriginDocCommentTurn) {
     if (replyLayout) {
       console.error('botmux send: --layout 不作用于文档评论回复，本次已忽略');
@@ -10053,7 +10078,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           sentAtMs: Date.now(),
           messageId: `doc:${exactDocTarget.commentId}`,
           responseKind: effectiveResponseKind,
-          ...(originTurnId ? { turnId: originTurnId } : {}),
+          turnId: originTurnId ?? exactDocTarget.turnId,
           ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           contentLength: content.length,
         };

@@ -51,26 +51,49 @@ function mergeRecoverySnapshot(ref: ActivityCardRef, candidate: ActivityCardRef)
   const retired = ref.retired || candidate.retired;
   const pendingRetired = ref.pendingRetired === true || candidate.pendingRetired === true;
   const conflict = ref.sequenceConflict === true || candidate.sequenceConflict === true;
-  if (candidate.sequence > ref.sequence) {
-    ref.sequence = candidate.sequence;
-    ref.events = candidate.events;
-    ref.pendingEvents = candidate.pendingEvents;
-    ref.pendingRetired = candidate.pendingRetired;
-    ref.page = candidate.page;
-  } else if (candidate.sequence === ref.sequence) {
-    // At the same sequence the two files may be on opposite sides of the
-    // acknowledgement. Retain the longest cumulative snapshot without
-    // replaying it twice; neither source can erase confirmed newer entries.
-    const currentEvents = ref.pendingEvents ?? ref.events;
-    const candidateEvents = candidate.pendingEvents ?? candidate.events;
-    if (candidateEvents.length > currentEvents.length) ref.pendingEvents = candidateEvents;
+  // Sequence orders provider requests, including page changes; it does NOT
+  // order content revisions. Only an append-only prefix proves one snapshot
+  // contains the other. Never drop a longer pending history behind a page's
+  // higher sequence, or guess between conflicting branches of content.
+  const currentEvents = ref.pendingEvents ?? ref.events;
+  const candidateEvents = candidate.pendingEvents ?? candidate.events;
+  const common = Math.min(currentEvents.length, candidateEvents.length);
+  for (let i = 0; i < common; i++) {
+    const a = currentEvents[i], b = candidateEvents[i];
+    if (a.event_type !== b.event_type || a.content !== b.content || a.timestamp !== b.timestamp) {
+      throw new Error('Activity recovery history diverged');
+    }
   }
+  if (candidateEvents.length > currentEvents.length) ref.pendingEvents = candidateEvents;
+  if (candidate.sequence > ref.sequence) ref.page = candidate.page;
+  ref.sequence = Math.max(ref.sequence, candidate.sequence);
   ref.messageId ||= candidate.messageId;
   ref.chatId ??= candidate.chatId;
   ref.publishUuid ??= candidate.publishUuid;
   ref.retired = retired;
   if (pendingRetired) ref.pendingRetired = true;
   if (conflict) ref.sequenceConflict = true;
+}
+
+/** Read all durable sources before EVERY writer, including an early click
+ * while startup recovery is blocked on another card. Missing files are normal;
+ * unreadable/corrupt checkpoints cannot authorize overwriting remote history. */
+function mergeDurableSnapshots(appId: string, ref: ActivityCardRef): void {
+  const read = (path: string): unknown => {
+    try { return JSON.parse(readFileSync(path, 'utf8')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+  };
+  const durable = read(recordPath(ref)) as ActivityCardRef | undefined;
+  if (durable) mergeRecoverySnapshot(ref, durable);
+  const orphan = read(join(config.session.dataDir, 'cot-orphans', `card-${ref.cardId}.json`)) as
+    { larkAppId?: string; activityCard?: ActivityCardRef } | undefined;
+  if (orphan) {
+    if (orphan.larkAppId !== appId || !orphan.activityCard) throw new Error('Activity orphan identity mismatch');
+    mergeRecoverySnapshot(ref, orphan.activityCard);
+  }
 }
 function recordPath(ref: Pick<ActivityCardRef, 'appId' | 'cardId'>): string {
   if (!ref.appId || !/^[A-Za-z0-9_-]+$/.test(ref.appId) || !/^[A-Za-z0-9_-]+$/.test(ref.cardId)) throw new Error('Invalid activity identity');
@@ -254,6 +277,7 @@ export async function updateActivityCard(
   const previous = writers.get(key) ?? Promise.resolve();
   const work = previous.catch(() => {}).then(async () => {
     mergeRecoverySnapshot(ref, candidate);
+    mergeDurableSnapshots(appId, ref);
     if (ref.sequenceConflict) throw new Error('Activity card sequence conflicts with remote state');
     if (selectedPage !== undefined) ref.page = selectedPage;
     const next = [...(ref.pendingEvents ?? ref.events), ...events];

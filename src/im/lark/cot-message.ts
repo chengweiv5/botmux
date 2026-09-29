@@ -239,8 +239,10 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         if (rec.larkAppId !== selfLarkAppId) continue; // sibling daemon's marker — leave it
         if (rec.activityCard) {
           const appId = rec.larkAppId;
-          const durable = readActivityCard(appId, rec.activityCard.cardId);
-          if (durable && durable.sequence > rec.activityCard.sequence) rec.activityCard = durable;
+          // Register any durable entity, but always pass the orphan as another
+          // candidate. A later page request can have a higher sequence while
+          // carrying less history; the writer merges content by prefix.
+          readActivityCard(appId, rec.activityCard.cardId);
           try {
             await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', ref => {
               rec.activityCard = ref;

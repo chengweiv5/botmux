@@ -383,4 +383,55 @@ describe('activity card lifecycle', () => {
     const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), 'utf8'));
     expect(saved).toMatchObject({ sequence: sequence + 1, retired: true, events: orphan.pendingEvents });
   });
+
+  it('loads orphan content before page writes can overtake startup recovery', async () => {
+    mkdirSync(directory(), { recursive: true });
+    mkdirSync(join(config.session.dataDir, 'cot-activity/app'), { recursive: true });
+    const events = [ev('REASONING_MESSAGE_CONTENT', { delta: 'a'.repeat(5000) })];
+    for (const cardId of ['page-first1', 'page-first2']) {
+      const ref = { appId: 'app', chatId: 'oc_chat', cardId, messageId: `om_${cardId}`, sequence: 5, events, retired: false };
+      writeFileSync(join(directory(), `card-${cardId}.json`), JSON.stringify({ larkAppId: 'app', cotId: `card-${cardId}`, messageId: ref.messageId, activityCard: ref }));
+      writeFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), JSON.stringify(ref));
+    }
+    const [firstId, targetId] = readdirSync(directory()).map(name => JSON.parse(readFileSync(join(directory(), name), 'utf8')).activityCard.cardId as string);
+    const targetMarker = join(directory(), `card-${targetId}.json`);
+    const target = JSON.parse(readFileSync(targetMarker, 'utf8'));
+    target.activityCard.sequence = 6;
+    target.activityCard.pendingEvents = [...events, ev('REASONING_MESSAGE_CONTENT', { delta: 'B_PENDING' })];
+    writeFileSync(targetMarker, JSON.stringify(target));
+    const normal = request.getMockImplementation()!;
+    let release!: (value: unknown) => void;
+    request.mockImplementation(async r => r.method === 'PUT' && r.url.endsWith('/' + firstId)
+      ? new Promise(resolve => { release = resolve; }) : normal(r));
+    const recovery = sweepOrphanCotMessages('app');
+    await drain(() => !!release);
+    await showActivityPage('app', `om_${targetId}`, 'oc_chat', targetId, 1, false);
+    await showActivityPage('app', `om_${targetId}`, 'oc_chat', targetId, 0, false);
+    const beforeRecovery = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${targetId}.json`), 'utf8'));
+    expect(beforeRecovery.events).toEqual(target.activityCard.pendingEvents);
+    release({ code: 0, data: {} });
+    await recovery;
+    expect(writes().filter(r => r.url.endsWith('/' + targetId)).map(r => r.data.sequence)).toEqual([7, 8, 9]);
+    const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${targetId}.json`), 'utf8'));
+    expect(saved.events).toEqual(target.activityCard.pendingEvents);
+    expect(saved.retired).toBe(true);
+    expect(existsSync(targetMarker)).toBe(false);
+  });
+
+  it('keeps conflicting recovery histories for investigation without a remote overwrite', async () => {
+    const cardId = 'conflicting';
+    const canonical = { appId: 'app', chatId: 'oc_chat', cardId, messageId: 'om_conflicting', sequence: 4,
+      events: [ev('REASONING_MESSAGE_CONTENT', { delta: 'canonical' })], retired: false };
+    mkdirSync(directory(), { recursive: true });
+    mkdirSync(join(config.session.dataDir, 'cot-activity/app'), { recursive: true });
+    writeFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), JSON.stringify(canonical));
+    const damaged = { ...canonical, sequence: 7, pendingEvents: [ev('REASONING_MESSAGE_CONTENT', { delta: 'other history' })] };
+    const marker = join(directory(), `card-${cardId}.json`);
+    writeFileSync(marker, JSON.stringify({ larkAppId: 'app', cotId: `card-${cardId}`, messageId: canonical.messageId, activityCard: damaged }));
+    const before = writes().length;
+    await expect(showActivityPage('app', canonical.messageId, 'oc_chat', cardId, 0, false)).rejects.toThrow('diverged');
+    await sweepOrphanCotMessages('app');
+    expect(writes()).toHaveLength(before);
+    expect(existsSync(marker)).toBe(true);
+  });
 });

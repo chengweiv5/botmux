@@ -8,7 +8,7 @@ export interface CotDelivery {
 
 /** Incremental reader of the session's existing send journal. Only completed
  * in-session deliveries explicitly marked by cmdSend can move the bubble.
- * Never uses a journal message id as a deletion target. */
+ * Journal message ids are only dedupe keys, never mutation targets. */
 export class CotSendObserver {
   private offset = 0;
   private inode = '';

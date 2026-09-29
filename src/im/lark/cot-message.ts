@@ -34,9 +34,9 @@
  *      error-path fallback so a failed terminal batch can't leave the bubble
  *      spinning forever.
  *   4. Completed in-session sends move the active bubble below the reply:
- *      replay confirmed display events, switch the writer, then recall the
- *      previous message. Coalesce bursts; migration failures leave the old
- *      bubble intact, recall failures disable further movement for this turn.
+ *      replay confirmed display events, switch the writer, then complete the
+ *      previous message without recalling it. Coalesce bursts; migration
+ *      failures leave the old bubble intact.
  *
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
@@ -435,21 +435,17 @@ async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 
   if (result?.code !== undefined && result.code !== 0) throw new Error(`CompleteCOT failed: ${result.code}`);
 }
 
-/** Retire only a CoT created by this module. Leave an orphan marker whenever
- * both recall and completion fail, so restart recovery can stop its spinner. */
+/** Preserve older bubbles as completed history. Never recall a message: Lark
+ * leaves a misleading recalled-message placeholder. Keep the orphan marker
+ * if completion fails, so restart recovery can stop its spinner. */
 async function retireBubble(ds: DaemonSession, state: CotState): Promise<boolean> {
   if (!state.cotId || !state.messageId) return true;
   try {
-    const result = await getBotClient(ds.larkAppId).request({
-      method: 'DELETE', url: `/open-apis/im/v1/messages/${encodeURIComponent(state.messageId)}`,
-      timeout: COT_REQUEST_TIMEOUT_MS,
-    } as any);
-    if (result?.code !== 0) throw new Error(`RecallCOT failed: ${result?.code}`);
+    await apiComplete(ds, state, 'done');
     clearCotOrphanMarker(state);
     return true;
   } catch (err) {
-    logger.warn(`[cot] recall failed msg=${state.messageId}: ${err instanceof Error ? err.message : String(err)}`);
-    try { await apiComplete(ds, state, 'done'); clearCotOrphanMarker(state); } catch { /* orphan sweep retries */ }
+    logger.warn(`[cot] completion failed msg=${state.messageId}: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
@@ -461,27 +457,42 @@ async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> 
   const canMove = () => !state.disabled && !state.settled && !state.finishStatus && !state.migrationDisabled
     && states.get(ds) === state && ds.session.status !== 'closed' && cotEnabled(ds);
   if (!canMove()) return;
-  const replacement: CotState = { ...state, cotId: undefined, messageId: undefined, followTimer: undefined };
+  const replacement: CotState = { ...state, cotId: undefined, messageId: undefined, followTimer: undefined,
+    resultLanguages: state.resultLanguages ? new Map(state.resultLanguages) : undefined };
   try {
     await apiCreate(ds, replacement);
     recordCotOrphanMarker(ds, replacement);
-    observeDeliveries(ds, state);
-    if (!canMove()) { await retireBubble(ds, replacement); return; }
+    // Even if the turn ends during create, the now-visible newest bubble
+    // must receive the full snapshot before being completed.
     await apiAppend(ds, replacement, state.history);
     observeDeliveries(ds, state);
-    if (!canMove()) { await retireBubble(ds, replacement); return; }
+
+    // Updates may arrive during replay. Capture them before switching so the
+    // newest visible bubble is complete even when shutdown has already marked
+    // this state settled. The pump owns the writer throughout this operation.
+    const pending = state.pendingEntries;
+    if (pending && pending.length > state.sentCount) {
+      const batch: CotEvent[] = [];
+      for (let i = state.sentCount; i < pending.length; i++) batch.push(...entryEvents(ds, replacement, pending[i], i));
+      await apiAppend(ds, replacement, batch);
+      state.history.push(...batch);
+      state.sentCount = pending.length;
+      state.lastReasoningId = replacement.lastReasoningId;
+      state.resultLanguages = replacement.resultLanguages;
+    }
 
     const previous: CotState = { ...state };
     state.cotId = replacement.cotId;
     state.messageId = replacement.messageId;
     state.createdAtMs = replacement.createdAtMs;
     state.lastMoveAtMs = Date.now();
+    if (!canMove() && !state.finishStatus && !state.settled) state.finishStatus = 'interrupted';
     if (!await retireBubble(ds, previous)) {
-      // One completed duplicate is preferable to accumulating another bubble
-      // on every progress message when the tenant cannot recall CoT messages.
+      // Avoid accumulating more live spinners when completion is unavailable.
       state.migrationDisabled = true;
       state.moveDueAtMs = undefined;
     }
+    if (state.settled) await retireBubble(ds, state);
   } catch (err) {
     state.migrationDisabled = true;
     state.moveDueAtMs = undefined;

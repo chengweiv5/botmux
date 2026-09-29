@@ -1287,14 +1287,43 @@ describe('activity bubble follows completed deliveries', () => {
     expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'current')).toBe(true);
   });
 
-  it('finishes draining when terminal arrives before a long journal is caught up', async () => {
+  it('does not create a late bubble when terminal arrives before journal catch-up', async () => {
     const old = JSON.stringify({ turnId: 'old', messageId: 'om_old', previewText: 'x'.repeat(4000) }) + '\n';
     writeFileSync(journal, old.repeat(600));
     handleCotThinkingUpdate(ds, upd([think('current')]));
     finalizeCotMessage(ds, 'om_turn1', 'completed');
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(creates()).toHaveLength(1);
-    expect(forBubble('cot1').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
+    expect(creates()).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['terminal', 'abort'])('settles an existing bubble despite an incomplete journal row on %s', async reason => {
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await flush();
+    appendFileSync(journal, '{"sentAtMs":10001');
+    handleCotThinkingUpdate(ds, upd([think('first'), think('last')]));
+    if (reason === 'terminal') finalizeCotMessage(ds, 'om_turn1', 'completed');
+    else abortCotMessage(ds);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(creates()).toHaveLength(1);
+    expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'last')).toBe(true);
+    expect(forBubble('cot1').filter((e: any) => e.event_type === 'RUN_FINISHED')).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps updating the existing bubble without migrating until a partial row completes', async () => {
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await flush();
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(500);
+    const row = JSON.stringify({ turnId: 'om_turn1', messageId: 'om_new', responseKind: 'progress', cotDelivery: { deliveredAtMs: Date.now() } });
+    appendFileSync(journal, row);
+    handleCotThinkingUpdate(ds, upd([think('first'), think('last')]));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(creates()).toHaveLength(1);
+    expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'last')).toBe(true);
+    appendFileSync(journal, '\n');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(creates()).toHaveLength(2);
   });
 });

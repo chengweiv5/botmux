@@ -21,6 +21,7 @@ export interface ActivityCardRef {
   chatId?: string;
   publishUuid?: string;
   page?: number;
+  expanded?: boolean;
   sequenceConflict?: boolean;
 }
 
@@ -177,10 +178,26 @@ export function activitySummary(events: readonly ActivityEvent[], english = fals
 }
 
 export function buildActivityCard(events: readonly ActivityEvent[], retired: boolean, english = false,
-  navigation?: { cardId: string; page?: number }): string {
+  navigation?: { cardId: string; page?: number; expanded?: boolean }): string {
   const items = itemsFrom(events);
   const last = items.at(-1);
   const summary = activitySummary(events, english);
+  if (retired && !navigation?.expanded) {
+    const text = { tag: 'div', margin: '0px', text: {
+      tag: 'plain_text', content: `${navigation ? '› ' : ''}${summary.replace(/\s+/g, ' ')}`,
+      text_color: 'grey', text_size: 'normal', lines: 1,
+    } };
+    // An ended segment is one line, not a collapsed panel with default header
+    // padding. Details are rendered only after an explicit click.
+    return stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0',
+      config: { update_multi: true, width_mode: 'default', summary: { content: summary } },
+      body: { padding: '0px', vertical_spacing: '0px', elements: navigation ? [{
+        tag: 'interactive_container', width: 'fill', height: '20px', padding: '0px', margin: '0px', has_border: false,
+        behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_toggle', card_id: navigation.cardId, expanded: true } }],
+        elements: [text],
+      }] : [text] },
+    }));
+  }
   const lastText = last?.kind === 'text' ? last.text.replace(/\s+/g, ' ').trim() : '';
   const live = last?.kind === 'tool'
     ? `${english ? 'In progress: ' : '正在'}${last.text.replace(/\s+/g, ' ').slice(0, 150)}…`
@@ -209,14 +226,16 @@ export function buildActivityCard(events: readonly ActivityEvent[], retired: boo
     { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { tag: 'plain_text', content: english ? 'Next' : '下一页' }, disabled: page === pages.length - 1,
       behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_page', card_id: navigation.cardId, page: page + 1 } }] }] },
   ] }] : [];
+  const collapseButton = retired && navigation ? [{ tag: 'button', text: { tag: 'plain_text', content: english ? 'Collapse' : '收起' },
+    behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_toggle', card_id: navigation.cardId, expanded: false } }] }] : [];
   const card = stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'default', summary: { content: retired ? summary : live } },
     body: { padding: '4px 8px 4px 8px', elements: [{
-      tag: 'collapsible_panel', expanded: false, padding: '0px',
+      tag: 'collapsible_panel', expanded: retired, padding: '0px',
       header: { title: { tag: 'markdown', content: title },
         icon: { tag: 'standard_icon', token: 'down_outlined', color: retired ? 'grey' : 'blue', size: '16px 16px' },
         icon_position: 'follow_text', icon_expanded_angle: -180 },
       elements: [{ tag: 'markdown', content: `<font color='grey'>${english ? 'Full activity record for this turn' : '本轮完整活动记录'}${pages.length > 1 ? ` · ${page + 1}/${pages.length}` : ''}</font>` },
-        { tag: 'markdown', content: detail }, ...pageButtons],
+        { tag: 'markdown', content: detail }, ...pageButtons, ...collapseButton],
     }] } }));
   if (Buffer.byteLength(JSON.stringify({ card: { type: 'card_json', data: card }, sequence: 2147483647 }), 'utf8') > 30_000) {
     throw new Error('Activity card exceeds byte budget');
@@ -269,7 +288,7 @@ export async function createActivityCard(
 
 export async function updateActivityCard(
   appId: string, ref: ActivityCardRef, events: readonly ActivityEvent[], retired: boolean, english: boolean,
-  checkpoint: (ref: ActivityCardRef) => void, selectedPage?: number,
+  checkpoint: (ref: ActivityCardRef) => void, selectedPage?: number, expanded?: boolean,
 ): Promise<void> {
   const candidate = ref;
   ref = canonicalRef(appId, ref);
@@ -280,8 +299,10 @@ export async function updateActivityCard(
     mergeDurableSnapshots(appId, ref);
     if (ref.sequenceConflict) throw new Error('Activity card sequence conflicts with remote state');
     if (selectedPage !== undefined) ref.page = selectedPage;
+    if (expanded !== undefined) ref.expanded = expanded;
     const next = [...(ref.pendingEvents ?? ref.events), ...events];
     const terminal = ref.retired || ref.pendingRetired === true || retired || next.some(e => e.event_type === 'RUN_FINISHED');
+    if (terminal && !ref.retired) ref.expanded = false;
     // Reserve before the network call. Recovery must use a newer sequence even
     // when the server accepted an update but the response was lost.
     ref.sequence++;
@@ -291,7 +312,7 @@ export async function updateActivityCard(
     persistActivityCard(ref);
     try {
       await request(appId, { method: 'PUT', url: `/open-apis/cardkit/v1/cards/${encodeURIComponent(ref.cardId)}`,
-        data: { card: { type: 'card_json', data: buildActivityCard(next, terminal, english, { cardId: ref.cardId, page: ref.page }) }, sequence: ref.sequence } });
+        data: { card: { type: 'card_json', data: buildActivityCard(next, terminal, english, { cardId: ref.cardId, page: ref.page, expanded: ref.expanded }) }, sequence: ref.sequence } });
     } catch (error) {
       if (((error as { code?: number }).code ?? (error as { response?: { data?: { code?: number } } }).response?.data?.code) === 300317) {
         ref.sequenceConflict = true;
@@ -314,7 +335,7 @@ export async function updateActivityCard(
  * the same app/chat. It never dispatches an agent or forwards transcript text. */
 export async function showActivityPage(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean): Promise<void> {
   const ref = await validateActivityPage(appId, messageId, chatId, cardId, page);
-  await updateActivityCard(appId, ref, [], ref.retired, english, persistActivityCard, page);
+  await updateActivityCard(appId, ref, [], ref.retired, english, persistActivityCard, page, ref.retired ? true : undefined);
 }
 
 async function validateActivityPage(appId: string, messageId: string, chatId: string, cardId: string, page: number): Promise<ActivityCardRef> {
@@ -344,7 +365,7 @@ async function validateActivityPage(appId: string, messageId: string, chatId: st
   return ref;
 }
 
-export async function handleActivityPageAction(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean) {
+export async function handleActivityPageAction(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean, expanded?: boolean) {
   if (!Number.isSafeInteger(page) || page < 0) throw new Error('Invalid activity page');
   const ref = readActivityCard(appId, cardId);
   if (!ref || ref.appId !== appId || ref.cardId !== cardId || !messageId || !chatId || ref.chatId !== chatId
@@ -352,5 +373,9 @@ export async function handleActivityPageAction(appId: string, messageId: string,
   // The dispatcher recognizes this envelope as an empty ACK and executes the
   // fresh publisher afterward. Missing-message verification also runs after
   // ACK: it can require two provider reads. No remote write precedes proof.
-  return { afterAck: () => showActivityPage(appId, messageId, chatId, cardId, page, english) };
+  return { afterAck: async () => {
+    if (expanded === undefined) return showActivityPage(appId, messageId, chatId, cardId, page, english);
+    const current = await validateActivityPage(appId, messageId, chatId, cardId, page);
+    await updateActivityCard(appId, current, [], current.retired, english, persistActivityCard, undefined, expanded);
+  } };
 }

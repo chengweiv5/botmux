@@ -301,6 +301,18 @@ describe('Card integration: full event flow', () => {
     await result.afterAck();
     expect(activityAfterAck).toHaveBeenCalledTimes(1);
   });
+
+  it('routes single-line activity expansion through the same authenticated afterAck publisher', async () => {
+    activityPageAction.mockClear(); activityAfterAck.mockClear();
+    const result = await handleCardAction({
+      action: { value: { action: 'get_cot_activity_toggle', card_id: 'activity1', expanded: true } },
+      operator: { open_id: 'ou_reader' },
+      context: { open_message_id: 'om_activity', open_chat_id: 'oc_activity' },
+    }, {} as CardHandlerDeps, APP_ID);
+    expect(result).toEqual({ afterAck: activityAfterAck });
+    expect(activityPageAction).toHaveBeenCalledWith(APP_ID, 'om_activity', 'oc_activity', 'activity1', 0, false, true);
+    expect(activityAfterAck).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     fakeLark.reset();
     sessionReplyResults = [];

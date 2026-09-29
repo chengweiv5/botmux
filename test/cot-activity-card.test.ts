@@ -13,6 +13,13 @@ import { getBot } from '../src/bot-registry.js';
 import { activitySummary, buildActivityCard, updateActivityCard, showActivityPage, handleActivityPageAction, type ActivityEvent } from '../src/im/lark/cot-activity-card.js';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 
+const isOneLineHistory = (card: any): boolean => {
+  const element = card.body.elements[0];
+  const row = element.tag === 'interactive_container' ? element.elements[0] : element;
+  return card.body.padding === '0px' && row.tag === 'div' && row.text.tag === 'plain_text'
+    && row.text.lines === 1 && row.text.text_color === 'grey';
+};
+
 const ev = (event_type: string, data: unknown): ActivityEvent => ({ event_type, content: JSON.stringify(data), timestamp: 100 });
 const eventHistory = [ev('REASONING_MESSAGE_CONTENT', { delta: 'Inspect access controls.' }),
   ev('TOOL_CALL_START', { toolCallName: 'Read', title: '读取文件 · a.ts' }),
@@ -22,13 +29,13 @@ const eventHistory = [ev('REASONING_MESSAGE_CONTENT', { delta: 'Inspect access c
 describe('activity card presentation', () => {
   it('uses a gray concrete action summary without implying task completion', () => {
     const card = JSON.parse(buildActivityCard(eventHistory, true));
-    const panel = card.body.elements[0];
-    expect(panel.expanded).toBe(false);
-    expect(panel.header.title.content).toBe("<font color='grey'>读取文件 1 次，执行命令 1 次</font>");
-    expect(panel.header.icon.color).toBe('grey');
+    expect(isOneLineHistory(card)).toBe(true);
+    expect(card.body.elements[0].text.content).toBe('读取文件 1 次，执行命令 1 次');
+    expect(card.body.elements).toHaveLength(1);
     expect(JSON.stringify(card)).not.toMatch(/任务已完成|Completed|done_outlined/);
-    expect(JSON.stringify(card)).toContain('Inspect access controls&#46;');
-    expect(JSON.stringify(card)).toContain('All tests passed&#46;');
+    const expanded = buildActivityCard(eventHistory, true, false, { cardId: 'history', expanded: true });
+    expect(expanded).toContain('Inspect access controls&#46;');
+    expect(expanded).toContain('All tests passed&#46;');
   });
 
   it('shows a live operation and preserves earlier records in the expanded body', () => {
@@ -45,7 +52,7 @@ describe('activity card presentation', () => {
 
   it('does not turn transcript text into mentions, HTML or links', () => {
     const raw = '<at id=all></at> [secret](https://example.com) <font color=red>text</font>';
-    const card = buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: raw })], true);
+    const card = buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: raw })], true, false, { cardId: 'escaped', expanded: true });
     const title = JSON.parse(card).body.elements[0].header.title.content;
     expect(title).toContain('&#60;at');
     expect(title).not.toContain('<at');
@@ -54,12 +61,12 @@ describe('activity card presentation', () => {
 
   it('keeps long histories complete without exceeding the component limit', () => {
     const text = '活动记录'.repeat(15_000);
-    const card = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true));
+    const card = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', expanded: true }));
     expect(Buffer.byteLength(JSON.stringify({ card: { type: 'card_json', data: JSON.stringify(card) }, sequence: 2147483647 }))).toBeLessThanOrEqual(30000);
     let rebuilt = '';
     const total = Number(card.body.elements[0].elements[0].content.match(/1\/(\d+)/)[1]);
     for (let page = 0; page < total; page++) {
-      const next = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', page }));
+      const next = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', page, expanded: true }));
       rebuilt += next.body.elements[0].elements[1].content;
       expect(Buffer.byteLength(JSON.stringify(next))).toBeLessThan(30000);
     }
@@ -76,7 +83,7 @@ describe('activity card presentation', () => {
 
   it('renders raw tables and other block syntax as literal text', () => {
     const text = '| a | b |\n|---|---|\n|1|2|\n\n'.repeat(5) + '---\n- list\n1. item\n:DONE:\n    indented';
-    const card = JSON.parse(buildActivityCard([ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'code', code: text }) })], true));
+    const card = JSON.parse(buildActivityCard([ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'code', code: text }) })], true, false, { cardId: 'literal', expanded: true }));
     const detail = card.body.elements[0].elements[1].content;
     const tokens = new MarkdownIt().parse(detail, {});
     expect(tokens.some(t => ['table_open', 'hr', 'bullet_list_open', 'ordered_list_open', 'code_block'].includes(t.type))).toBe(false);
@@ -126,10 +133,10 @@ describe('activity card lifecycle', () => {
     update('first');
     await drain(() => JSON.stringify(lastCard('card1')).includes('first'));
     sendMarker(); await vi.advanceTimersByTimeAsync(2_000);
-    await drain(() => JSON.stringify(lastCard('card1')).includes("color='grey'"));
+    await drain(() => isOneLineHistory(lastCard('card1')));
     expect(sends()).toHaveLength(2);
     expect(sends()[0].data.reply_in_thread).toBe(true);
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("<font color='grey'>");
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
     expect(JSON.stringify(lastCard('card2'))).toContain('first');
     handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries: [{ kind: 'text', text: 'first' }, { kind: 'text', text: 'second' }] });
     await drain(() => JSON.stringify(lastCard('card2')).includes('second'));
@@ -138,7 +145,7 @@ describe('activity card lifecycle', () => {
     finalizeCotMessage(ds, 'om_turn', 'completed');
     await drain(() => !existsSync(join(directory(), 'card-card2.json')));
     expect(sends()).toHaveLength(2);
-    expect(lastCard('card2').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('card2'))).toBe(true);
   });
 
   it.each(['final', 'new-turn'])('does not publish an in-flight entity after %s', async cause => {
@@ -168,7 +175,7 @@ describe('activity card lifecycle', () => {
     expect(existsSync(path)).toBe(false);
     expect(writes().at(-1).data.sequence).toBeGreaterThan(maxSequence);
     expect(JSON.stringify(lastCard('card1'))).toContain('saved history');
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
   });
 
   it('serializes shutdown and updates without restoring a working title', async () => {
@@ -177,7 +184,7 @@ describe('activity card lifecycle', () => {
     await settleCotMessageForShutdown(ds);
     const sequences = writes().map(r => r.data.sequence);
     expect(sequences.every((n, i) => i === 0 || n > sequences[i - 1])).toBe(true);
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
   });
 
   it('retains pending history for recovery when a card update response fails', async () => {
@@ -195,6 +202,7 @@ describe('activity card lifecycle', () => {
     expect(saved.activityCard.pendingEvents).toBeDefined();
     fail = false;
     await sweepOrphanCotMessages('app');
+    await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 0, false);
     expect(JSON.stringify(lastCard('card1'))).toContain('last saved step');
     expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
   });
@@ -204,7 +212,7 @@ describe('activity card lifecycle', () => {
     request.mockResolvedValueOnce({ code: 999 });
     await expect(updateActivityCard('app', ref, [], true, false, () => {})).rejects.toThrow();
     await updateActivityCard('app', ref, [ev('REASONING_MESSAGE_CONTENT', { delta: 'late' })], false, false, () => {});
-    expect(lastCard('standalone').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('standalone'))).toBe(true);
   });
 
   it('respects hidden tool results after a migration', async () => {
@@ -251,7 +259,7 @@ describe('activity card lifecycle', () => {
     expect(marker.activityCard.cardId).toBe('card1');
     expect(JSON.stringify(marker.activityCard.events)).toContain('history before publication');
     await sweepOrphanCotMessages('app');
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
     expect(sends()).toHaveLength(1);
   });
 
@@ -272,7 +280,7 @@ describe('activity card lifecycle', () => {
     expect(JSON.stringify(lastCard('card1'))).toContain('FINAL&#95;RECORD');
     finalizeCotMessage(ds, 'om_turn', 'completed');
     await drain(() => !existsSync(join(directory(), 'card-card1.json')));
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
     await expect(showActivityPage('app', 'om_other', 'oc_chat', 'card1', 0, false)).rejects.toThrow('identity');
     await expect(showActivityPage('app', 'om_card1', 'oc_other', 'card1', 0, false)).rejects.toThrow('identity');
   });
@@ -300,6 +308,30 @@ describe('activity card lifecycle', () => {
     expect(writes()).toHaveLength(before);
     await response.afterAck();
     expect(writes()).toHaveLength(before + 1);
+  });
+
+  it('retired cards occupy one text line and expand only after an explicit click', async () => {
+    update('Full detail '.repeat(100));
+    await drain(() => existsSync(join(directory(), 'card-card1.json'))
+      && JSON.parse(readFileSync(join(directory(), 'card-card1.json'), 'utf8')).messageId === 'om_card1');
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    await drain(() => !existsSync(join(directory(), 'card-card1.json')));
+    const compact = lastCard('card1');
+    expect(isOneLineHistory(compact)).toBe(true);
+    expect(compact.body.elements[0]).toMatchObject({ height: '20px', padding: '0px', margin: '0px', has_border: false });
+    expect(compact.body.elements[0].elements).toHaveLength(1);
+    expect(JSON.stringify(compact)).not.toContain('collapsible_panel');
+    expect(JSON.stringify(compact)).not.toContain('本轮完整活动记录');
+
+    const expand = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 0, false, true);
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
+    await expand.afterAck();
+    expect(lastCard('card1').body.elements[0].expanded).toBe(true);
+    expect(lastCard('card1').body.elements[0].elements[1].content).toBe('Full detail '.repeat(100));
+    const collapse = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 0, false, false);
+    await collapse.afterAck();
+    expect(isOneLineHistory(lastCard('card1'))).toBe(true);
+    expect(sends()).toHaveLength(1);
   });
 
   it('repairs a lost message binding only after verifying provider ownership and entity mapping', async () => {
@@ -377,11 +409,13 @@ describe('activity card lifecycle', () => {
     await sweepOrphanCotMessages('app');
     const published = writes().find(r => r.url.endsWith('/' + cardId));
     expect(published.data.sequence).toBe(sequence + 1);
-    const detail = JSON.parse(published.data.card.data).body.elements[0].elements[1].content;
+    expect(isOneLineHistory(JSON.parse(published.data.card.data))).toBe(true);
+    await showActivityPage('app', ref.messageId, 'oc_chat', cardId, 0, false);
+    const detail = lastCard(cardId).body.elements[0].elements[1].content;
     expect(detail).toBe('a\n\nb');
     expect(existsSync(marker)).toBe(false);
     const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), 'utf8'));
-    expect(saved).toMatchObject({ sequence: sequence + 1, retired: true, events: orphan.pendingEvents });
+    expect(saved).toMatchObject({ sequence: sequence + 2, retired: true, events: orphan.pendingEvents });
   });
 
   it('loads orphan content before page writes can overtake startup recovery', async () => {

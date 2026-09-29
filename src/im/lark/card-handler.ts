@@ -1184,11 +1184,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  if (value?.action === 'get_cot_activity_page' && larkAppId) {
+  if ((value?.action === 'get_cot_activity_page' || value?.action === 'get_cot_activity_toggle') && larkAppId) {
     const chatId = data?.context?.open_chat_id;
     if (!operatorOpenId || !cardMessageId || !chatId) return { toast: { type: 'error', content: '无法确认活动卡片来源' } };
     try {
       const { handleActivityPageAction } = await import('./cot-activity-card.js');
+      if (value.action === 'get_cot_activity_toggle') {
+        if (typeof value.expanded !== 'boolean') throw new Error('Invalid expansion');
+        return await handleActivityPageAction(larkAppId, cardMessageId, chatId, String(value.card_id ?? ''), 0, localeForBot(larkAppId) === 'en', value.expanded);
+      }
       return await handleActivityPageAction(larkAppId, cardMessageId, chatId, String(value.card_id ?? ''), Number(value.page), localeForBot(larkAppId) === 'en');
     } catch {
       return { toast: { type: 'error', content: '无法加载该页，请稍后重试' } };

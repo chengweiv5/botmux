@@ -57,7 +57,7 @@ import { localeForBot, t } from '../../i18n/index.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { CotSendObserver } from '../../services/cot-send-observer.js';
-import { createActivityCard, updateActivityCard, type ActivityCardRef } from './cot-activity-card.js';
+import { createActivityCard, readActivityCard, updateActivityCard, type ActivityCardRef } from './cot-activity-card.js';
 
 /** Bounds every CoT HTTP call so a hung endpoint can't pin the pump. */
 const COT_REQUEST_TIMEOUT_MS = 15_000;
@@ -172,7 +172,9 @@ function recordCotOrphanMarker(ds: DaemonSession, state: CotState): void {
       messageId: state.messageId,
       ...(state.activityCard ? { activityCard: state.activityCard } : {}),
     }), { mode: 0o600, followTargetSymlink: false });
-  } catch { /* cosmetic */ }
+  } catch (error) {
+    if (state.activityCard) throw error; // activity checkpoints authorize the next remote update
+  }
 }
 
 function clearCotOrphanMarker(state: CotState): void {
@@ -233,10 +235,12 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
     const p = join(cotOrphanDir(), f);
     try {
       const rec = JSON.parse(readFileSync(p, 'utf8')) as { larkAppId?: string; cotId?: string; messageId?: string; activityCard?: ActivityCardRef };
-      if (rec.larkAppId && rec.cotId && rec.messageId) {
+      if (rec.larkAppId && rec.cotId && (rec.messageId || rec.activityCard)) {
         if (rec.larkAppId !== selfLarkAppId) continue; // sibling daemon's marker — leave it
         if (rec.activityCard) {
           const appId = rec.larkAppId;
+          const durable = readActivityCard(appId, rec.activityCard.cardId);
+          if (durable && durable.sequence >= rec.activityCard.sequence) rec.activityCard = durable;
           try {
             await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', () => {
               atomicWriteFileSync(p, JSON.stringify(rec), { mode: 0o600, followTargetSymlink: false });
@@ -408,16 +412,27 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
   state.createdAtMs = Date.now();
   if (state.display === 'activity') {
     const owner = states.get(ds);
+    const initialEvents = state.history.length ? state.history : [
+      ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
+      ev('REASONING_START', { messageId: reasoningId(state, 0) }),
+      ...(state.pendingEntries ?? []).flatMap((entry, i) => entryEvents(ds, state, entry, i)),
+    ];
+    const initialCount = state.history.length ? state.sentCount : state.pendingEntries?.length ?? 0;
     const ref = await createActivityCard(ds.larkAppId, ds.chatId, cotPlacement(ds, state), localeForBot(ds.larkAppId) === 'en', () => {
       if (owner) observeDeliveries(ds, owner);
       return states.get(ds) === owner && !owner?.finishStatus && !owner?.settled
+        && owner?.observer.caughtUp !== false
         && !state.finishStatus && ds.session.status !== 'closed' && cotEnabled(ds)
         && (!ds.currentTurnId || ds.currentTurnId === state.turnId);
-    });
-    if (!ref) { state.settled = true; return; }
-    state.activityCard = ref;
-    state.cotId = `card-${ref.cardId}`;
-    state.messageId = ref.messageId;
+    }, ref => {
+      state.activityCard = ref;
+      state.cotId = `card-${ref.cardId}`;
+      state.messageId = ref.messageId;
+      recordCotOrphanMarker(ds, state);
+    }, initialEvents);
+    if (!ref) { state.settled = true; clearCotOrphanMarker(state); return; }
+    state.history = initialEvents;
+    state.sentCount = initialCount;
     return;
   }
   const res = await c.request({
@@ -482,7 +497,7 @@ async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 
  * leaves a misleading recalled-message placeholder. Keep the orphan marker
  * if completion fails, so restart recovery can stop its spinner. */
 async function retireBubble(ds: DaemonSession, state: CotState): Promise<boolean> {
-  if (!state.cotId || !state.messageId) return true;
+  if (!state.cotId || (!state.messageId && !state.activityCard)) return true;
   try {
     await apiComplete(ds, state, 'done');
     clearCotOrphanMarker(state);
@@ -520,7 +535,7 @@ async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> 
     recordCotOrphanMarker(ds, replacement);
     // Even if the turn ends during create, the now-visible newest bubble
     // must receive the full snapshot before being completed.
-    await apiAppend(ds, replacement, state.history);
+    if (!replacement.activityCard) await apiAppend(ds, replacement, state.history);
     observeDeliveries(ds, state);
 
     // Updates may arrive during replay. Capture them before switching so the
@@ -788,8 +803,10 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
         ];
-        await apiAppend(ds, state, prologue);
-        state.history.push(...prologue);
+        if (!state.activityCard) {
+          await apiAppend(ds, state, prologue);
+          state.history.push(...prologue);
+        }
         logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 24)}`);
       }
       const pending = state.pendingEntries;

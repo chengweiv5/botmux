@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import MarkdownIt from 'markdown-it';
 
 const request = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({
@@ -9,7 +10,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
-import { activitySummary, buildActivityCard, updateActivityCard, type ActivityEvent } from '../src/im/lark/cot-activity-card.js';
+import { activitySummary, buildActivityCard, updateActivityCard, showActivityPage, type ActivityEvent } from '../src/im/lark/cot-activity-card.js';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 
 const ev = (event_type: string, data: unknown): ActivityEvent => ({ event_type, content: JSON.stringify(data), timestamp: 100 });
@@ -26,14 +27,14 @@ describe('activity card presentation', () => {
     expect(panel.header.title.content).toBe("<font color='grey'>读取文件 1 次，执行命令 1 次</font>");
     expect(panel.header.icon.color).toBe('grey');
     expect(JSON.stringify(card)).not.toMatch(/任务已完成|Completed|done_outlined/);
-    expect(JSON.stringify(card)).toContain('Inspect access controls.');
-    expect(JSON.stringify(card)).toContain('All tests passed.');
+    expect(JSON.stringify(card)).toContain('Inspect access controls&#46;');
+    expect(JSON.stringify(card)).toContain('All tests passed&#46;');
   });
 
   it('shows a live operation and preserves earlier records in the expanded body', () => {
     const card = JSON.parse(buildActivityCard(eventHistory.slice(0, -1), false));
     expect(card.body.elements[0].header.title.content).toContain('正在执行命令');
-    expect(JSON.stringify(card)).toContain('Inspect access controls.');
+    expect(JSON.stringify(card)).toContain('Inspect access controls&#46;');
     expect(JSON.stringify(card)).toContain('本轮完整活动记录');
   });
 
@@ -54,8 +55,15 @@ describe('activity card presentation', () => {
   it('keeps long histories complete without exceeding the component limit', () => {
     const text = '活动记录'.repeat(15_000);
     const card = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true));
-    expect(card.body.elements[0].elements.at(-1).content).toBe(text);
-    expect(card.body.elements[0].elements).toHaveLength(2);
+    expect(Buffer.byteLength(JSON.stringify({ card: { type: 'card_json', data: JSON.stringify(card) }, sequence: 2147483647 }))).toBeLessThanOrEqual(30000);
+    let rebuilt = '';
+    const total = Number(card.body.elements[0].elements[0].content.match(/1\/(\d+)/)[1]);
+    for (let page = 0; page < total; page++) {
+      const next = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', page }));
+      rebuilt += next.body.elements[0].elements[1].content;
+      expect(Buffer.byteLength(JSON.stringify(next))).toBeLessThan(30000);
+    }
+    expect(rebuilt).toBe(text);
   });
 
   it('does not show a completion label for redacted tool results', () => {
@@ -64,6 +72,16 @@ describe('activity card presentation', () => {
     expect(activitySummary([], true)).toBe('Activity record');
     const live = JSON.parse(buildActivityCard([eventHistory[2], ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'text', text: '✓ 已完成' }) })], false));
     expect(live.body.elements[0].header.title.content).toBe('正在处理…');
+  });
+
+  it('renders raw tables and other block syntax as literal text', () => {
+    const text = '| a | b |\n|---|---|\n|1|2|\n\n'.repeat(5) + '---\n- list\n1. item\n:DONE:\n    indented';
+    const card = JSON.parse(buildActivityCard([ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'code', code: text }) })], true));
+    const detail = card.body.elements[0].elements[1].content;
+    const tokens = new MarkdownIt().parse(detail, {});
+    expect(tokens.some(t => ['table_open', 'hr', 'bullet_list_open', 'ordered_list_open', 'code_block'].includes(t.type))).toBe(false);
+    expect(detail).toContain('&#124;');
+    expect(detail).not.toContain(':DONE:');
   });
 });
 
@@ -193,10 +211,82 @@ describe('activity card lifecycle', () => {
     vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, cotDisplay: 'activity', thinkingCardToolResult: false } } as any);
     const entries: any[] = [{ kind: 'tool_call', id: 't1', name: 'Bash', args: '{}'}, { kind: 'tool_result', id: 't1', result: 'DO_NOT_EXPOSE' }];
     handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries });
-    await drain(() => writes().length >= 2);
+    await drain(() => sends().length === 1);
     vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, cotDisplay: 'activity', thinkingCardToolResult: true } } as any);
     sendMarker(); await vi.advanceTimersByTimeAsync(2_000);
     await drain(() => sends().length === 2 && writes().some(r => r.url.endsWith('/card2')));
     expect(JSON.stringify(lastCard('card2'))).not.toContain('DO_NOT_EXPOSE');
+  });
+
+  it('never sends updates after checkpoint storage becomes unavailable', async () => {
+    update('a');
+    await drain(() => sends().length === 1);
+    await drain(() => existsSync(join(directory(), 'card-card1.json')));
+    const before = writes().length;
+    rmSync(directory(), { recursive: true, force: true });
+    writeFileSync(directory(), 'unwritable marker directory');
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries: [{ kind: 'text', text: 'a' }, { kind: 'text', text: 'b' }] });
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    expect(writes()).toHaveLength(before);
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    expect(writes()).toHaveLength(before);
+    rmSync(directory());
+  });
+
+  it('recovers the known entity after a lost publish response without publishing again', async () => {
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => {
+      if (r.url.endsWith('/reply')) {
+        expect(existsSync(join(directory(), 'card-card1.json'))).toBe(true);
+        expect(r.data.uuid).toMatch(/^[a-f0-9-]{36}$/);
+        throw new Error('response lost after accepted');
+      }
+      return normal(r);
+    });
+    update('history before publication');
+    await drain(() => sends().length === 1);
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    const marker = JSON.parse(readFileSync(join(directory(), 'card-card1.json'), 'utf8'));
+    expect(marker.activityCard.cardId).toBe('card1');
+    expect(JSON.stringify(marker.activityCard.events)).toContain('history before publication');
+    await sweepOrphanCotMessages('app');
+    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(sends()).toHaveLength(1);
+  });
+
+  it('keeps over-limit history available by paging and can retire every page', async () => {
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => {
+      const serialized = r.data?.card?.data ?? (r.url === '/open-apis/cardkit/v1/cards' ? r.data?.data : undefined);
+      if (serialized) expect(Buffer.byteLength(JSON.stringify(r.data))).toBeLessThanOrEqual(30_000);
+      return normal(r);
+    });
+    const text = 'begin ' + 'abc'.repeat(20_000) + ' FINAL_RECORD';
+    update(text); await drain(() => sends().length === 1);
+    await drain(() => JSON.parse(readFileSync(join(directory(), 'card-card1.json'), 'utf8')).messageId === 'om_card1');
+    const panel = lastCard('card1').body.elements[0];
+    const total = Number(panel.elements[0].content.match(/1\/(\d+)/)[1]);
+    expect(total).toBeGreaterThan(1);
+    await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', total - 1, false);
+    expect(JSON.stringify(lastCard('card1'))).toContain('FINAL&#95;RECORD');
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    await drain(() => !existsSync(join(directory(), 'card-card1.json')));
+    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    await expect(showActivityPage('app', 'om_other', 'oc_chat', 'card1', 0, false)).rejects.toThrow('identity');
+    await expect(showActivityPage('app', 'om_card1', 'oc_other', 'card1', 0, false)).rejects.toThrow('identity');
+  });
+
+  it('does not repeatedly increase sequence to overwrite unrecognized remote state', async () => {
+    update('safe'); await drain(() => sends().length === 1);
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => r.method === 'PUT' ? { code: 300317 } : normal(r));
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries: [{ kind: 'text', text: 'safe' }, { kind: 'text', text: 'new' }] });
+    await drain(() => writes().length === 2);
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    const count = writes().length;
+    await sweepOrphanCotMessages('app');
+    await sweepOrphanCotMessages('app');
+    expect(writes()).toHaveLength(count);
   });
 });

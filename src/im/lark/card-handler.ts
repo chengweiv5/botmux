@@ -1184,6 +1184,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
+  if (value?.action === 'get_cot_activity_page' && larkAppId) {
+    const chatId = data?.context?.open_chat_id;
+    if (!operatorOpenId || !cardMessageId || !chatId) return { toast: { type: 'error', content: '无法确认活动卡片来源' } };
+    try {
+      const { showActivityPage } = await import('./cot-activity-card.js');
+      await showActivityPage(larkAppId, cardMessageId, chatId, String(value.card_id ?? ''), Number(value.page), localeForBot(larkAppId) === 'en');
+      return {};
+    } catch {
+      return { toast: { type: 'error', content: '无法加载该页，请稍后重试' } };
+    }
+  }
   // ─── 机器过载告警卡动作（overload_clean_stopped / overload_suspend_idle / noop）──
   // 不绑 session。owner 强闸门 + nonce 一次性核销（每按钮各一次，防重复点/超时重投/旧卡）。
   // 点完不替换成死卡：重建同一张卡，把点过的按钮标 done+数量并 disabled，另一个仍可点。

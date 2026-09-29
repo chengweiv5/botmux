@@ -21,8 +21,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ config: { cotEnabled: true } }),
   getBotClient: () => ({ request }),
 }));
-import { finalizeCotMessage, handleCotThinkingUpdate } from '../src/im/lark/cot-message.js';
+import { finalizeCotMessage, handleCotThinkingUpdate, handleCotThinkingSuperseded } from '../src/im/lark/cot-message.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
 
 let child: ChildProcess | undefined;
 let root: string | undefined;
@@ -104,6 +105,7 @@ setInterval(() => {
         const msg = raw as WorkerToDaemon;
         messages.push(msg);
         if (msg.type === 'thinking_update') handleCotThinkingUpdate(ds, msg);
+        if (msg.type === 'thinking_superseded') handleCotThinkingSuperseded(ds, msg);
         if (msg.type === 'turn_terminal') finalizeCotMessage(ds, msg.turnId, msg.status);
       });
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
@@ -167,6 +169,109 @@ setInterval(() => {
       expect(events().filter(event => event.event_type === 'TOOL_CALL_START')).toHaveLength(1);
       expect(events().filter(event => event.event_type === 'TOOL_CALL_RESULT')).toHaveLength(1);
       expect(events().filter(event => event.event_type === 'RUN_FINISHED')).toHaveLength(1);
+    }, 30_000);
+  }
+
+  for (const { backendType, stopReason, status } of [
+    { backendType: 'pty', stopReason: 'stop', status: 'completed' },
+    { backendType: 'tmux', stopReason: 'stop', status: 'completed' },
+    { backendType: 'pty', stopReason: 'error', status: 'failed' },
+    { backendType: 'pty', stopReason: 'aborted', status: 'ambiguous' },
+  ] as const) {
+    it.skipIf(backendType === 'tmux' && !tmuxAvailable)(`closes a steered-away bubble even when the successor has no CoT (${backendType}, ${stopReason})`, async () => {
+      root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-cot-steer-'));
+      const dataDir = join(root, 'data');
+      const cliSessionId = 'deadbeef-1234-4678-9abc-def012345679';
+      const piSessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+      mkdirSync(dataDir, { recursive: true });
+      mkdirSync(piSessionsDir, { recursive: true });
+      const transcript = join(piSessionsDir, `20260929_${cliSessionId}.jsonl`);
+      writeFileSync(transcript, '');
+      const fakePi = join(root, 'fake-pi');
+      writeFileSync(fakePi, `#!/usr/bin/env node
+process.stdout.write('Done\\n');
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`);
+      chmodSync(fakePi, 0o755);
+      const messages: WorkerToDaemon[] = [];
+      const logs: string[] = [];
+      const ds = {
+        larkAppId: 'app_test', chatId: 'oc_test',
+        session: { sessionId: 'sid-pi-steer', rootMessageId: 'om_root' },
+      } as DaemonSession;
+      child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+        cwd: resolve('.'),
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'sid-pi-steer', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test-only' },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      child.on('message', raw => {
+        const msg = raw as WorkerToDaemon;
+        messages.push(msg);
+        if (msg.type === 'thinking_update') handleCotThinkingUpdate(ds, msg);
+        if (msg.type === 'thinking_superseded') handleCotThinkingSuperseded(ds, msg);
+        if (msg.type === 'turn_terminal') finalizeCotMessage(ds, msg.turnId, msg.status);
+      });
+      child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+      child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+      if (backendType === 'tmux') tmuxSession = `pi-steer-${process.pid}-${Date.now()}`;
+      child.send({
+        type: 'init', sessionId: 'sid-pi-steer', chatId: 'oc_test', rootMessageId: 'om_root',
+        workingDir: dataDir, cliId: 'pi', cliPathOverride: fakePi, cliSessionId, backendType,
+        ...(tmuxSession ? { tmuxSessionName: tmuxSession } : {}),
+        prompt: 'warmup', larkAppId: 'app_test', larkAppSecret: 'test-only', turnId: 'om_warmup',
+      } satisfies DaemonToWorker);
+      await waitUntil(() => logs.some(line => line.includes('Codex bridge fresh-empty:')), logs);
+      const append = (...rows: object[]) => appendFileSync(transcript, rows.map(message => JSON.stringify({
+        type: 'message', timestamp: new Date().toISOString(), message,
+      })).join('\n') + '\n');
+      const user = (text: string) => ({ role: 'user', content: [{ type: 'text', text }] });
+      append(user('warmup'), { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'ready' }] });
+      await waitUntil(() => messages.some(msg => msg.type === 'prompt_ready')
+        && messages.some(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_warmup'), logs);
+      child.send({ type: 'message', content: 'first request', turnId: 'om_first' } satisfies DaemonToWorker);
+      await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush): "first request')), logs);
+      append(user('first request'), { role: 'assistant', stopReason: 'toolUse', content: [
+        { type: 'toolCall', id: 'read-1', name: 'read', arguments: { path: 'src/main.ts' } },
+      ] });
+      await waitUntil(() => messages.some(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first'), logs);
+      child.send({ type: 'message', content: 'steer request', turnId: 'om_steer' } satisfies DaemonToWorker);
+      await waitUntil(() => logs.some(line => line.includes('Writing to PTY (flush): "steer request')), logs);
+      append({ role: 'toolResult', toolCallId: 'read-1', content: [{ type: 'text', text: 'result' }] }, user('steer request'));
+
+      // The old bubble must end at the confirmed steer, before B produces
+      // anything at all. Closing the UI must not synthesize a task terminal.
+      const events = () => request.mock.calls.flatMap(([req]) => req.data?.events ?? []);
+      await waitUntil(() => events().some(event => event.event_type === 'RUN_FINISHED'), logs);
+      const activity = messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'thinking_update' }> =>
+        msg.type === 'thinking_update' && msg.turnId === 'om_first');
+      const superseded = messages.filter(msg => msg.type === 'thinking_superseded');
+      expect(superseded).toMatchObject([{ turnId: 'om_first', sessionId: 'sid-pi-steer' }]);
+      expect(activity.at(-1)?.entries.at(-1)).toEqual({ kind: 'tool_result', id: 'read-1', result: 'result' });
+      expect(messages.indexOf(activity.at(-1)!)).toBeLessThan(messages.indexOf(superseded[0]));
+      expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId !== 'om_warmup')).toEqual([]);
+
+      append({ role: 'assistant', stopReason,
+        content: stopReason === 'stop' ? [{ type: 'text', text: 'final answer' }] : [],
+        ...(stopReason === 'error' ? { errorMessage: 'service unavailable' } : {}),
+      });
+      if (stopReason === 'error') appendFileSync(transcript, JSON.stringify({
+        type: 'custom', timestamp: new Date().toISOString(), customType: PI_TURN_BOUNDARY_CUSTOM_TYPE,
+        data: { lastStopReason: 'error' },
+      }) + '\n');
+      await waitUntil(() => messages.some(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_steer'), logs);
+      // Let the old trailing throttle expire: no late update may reopen A.
+      await new Promise(done => setTimeout(done, 1600));
+      expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_first')).toEqual([]);
+      expect(messages.filter(msg => msg.type === 'turn_terminal' && msg.turnId === 'om_steer')).toMatchObject([{ status }]);
+      expect(messages.filter(msg => msg.type === 'thinking_update' && msg.turnId === 'om_steer')).toEqual([]);
+      expect(messages.filter(msg => msg.type === 'thinking_update' && msg.turnId === 'om_first')).toHaveLength(activity.length);
+      const wireEvents = events();
+      expect(wireEvents.filter(event => event.event_type === 'RUN_STARTED')).toHaveLength(1);
+      expect(wireEvents.filter(event => event.event_type === 'RUN_FINISHED')).toHaveLength(1);
+      expect(wireEvents.findIndex(event => event.event_type === 'TOOL_CALL_RESULT'))
+        .toBeLessThan(wireEvents.findIndex(event => event.event_type === 'RUN_FINISHED'));
     }, 30_000);
   }
 });

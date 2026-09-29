@@ -4967,6 +4967,19 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
   if (turn.isLocal) return;
   observeCotEntries(entries, turn);
 });
+codexBridgeQueue.setCotSupersededObserver((turn) => {
+  if (!sessionId || turn.isLocal || thinkingTurn?.turnId !== turn.turnId
+    || thinkingTurn.dispatchAttempt !== turn.dispatchAttempt) return;
+  // A successor may answer without ever producing CoT. Flush and close the
+  // retired timeline at the queue's confirmed steer edge, not its successor's
+  // first update/terminal. Never synthesize a durable terminal for this UI.
+  flushThinkingUpdate();
+  send({
+    type: 'thinking_superseded', sessionId, turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+  });
+  resetThinkingChannel();
+});
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
 let ompBridgeState: OmpTranscriptState = {};

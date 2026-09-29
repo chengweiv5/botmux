@@ -34,6 +34,9 @@ import {
 // ─── Shared state ─────────────────────────────────────────────────────────
 
 const fakeLark = new FakeLarkClient();
+const activityAfterAck = vi.fn(async () => {});
+const activityPageAction = vi.fn(async (..._args: unknown[]) => ({ afterAck: activityAfterAck }));
+vi.mock('../src/im/lark/cot-activity-card.js', () => ({ handleActivityPageAction: (...args: unknown[]) => activityPageAction(...args) }));
 let sessionReplyResults: string[] = [];
 let sessionReplyCallIndex = 0;
 const { deleteMessageMock } = vi.hoisted(() => ({
@@ -285,6 +288,19 @@ function parseCard(json: string): any {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 describe('Card integration: full event flow', () => {
+  it('passes activity paging through the afterAck contract without returning an empty card', async () => {
+    activityPageAction.mockClear(); activityAfterAck.mockClear();
+    const result = await handleCardAction({
+      action: { value: { action: 'get_cot_activity_page', card_id: 'activity1', page: 1 } },
+      operator: { open_id: 'ou_reader' },
+      context: { open_message_id: 'om_activity', open_chat_id: 'oc_activity' },
+    }, {} as CardHandlerDeps, APP_ID);
+    expect(result).toEqual({ afterAck: activityAfterAck });
+    expect(activityPageAction).toHaveBeenCalledWith(APP_ID, 'om_activity', 'oc_activity', 'activity1', 1, false);
+    expect(activityAfterAck).not.toHaveBeenCalled();
+    await result.afterAck();
+    expect(activityAfterAck).toHaveBeenCalledTimes(1);
+  });
   beforeEach(() => {
     fakeLark.reset();
     sessionReplyResults = [];

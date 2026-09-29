@@ -242,7 +242,8 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
           const durable = readActivityCard(appId, rec.activityCard.cardId);
           if (durable && durable.sequence >= rec.activityCard.sequence) rec.activityCard = durable;
           try {
-            await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', () => {
+            await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', ref => {
+              rec.activityCard = ref;
               atomicWriteFileSync(p, JSON.stringify(rec), { mode: 0o600, followTargetSymlink: false });
             });
           } catch (err) {
@@ -459,7 +460,7 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
   if (state.activityCard) {
     const target = { ...state };
     await updateActivityCard(ds.larkAppId, target.activityCard!, events, false, localeForBot(ds.larkAppId) === 'en',
-      () => recordCotOrphanMarker(ds, target));
+      ref => { target.activityCard = ref; recordCotOrphanMarker(ds, target); });
     return;
   }
   const c = getBotClient(ds.larkAppId);
@@ -480,7 +481,7 @@ async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 
   if (state.activityCard) {
     const target = { ...state };
     await updateActivityCard(ds.larkAppId, target.activityCard!, [], true, localeForBot(ds.larkAppId) === 'en',
-      () => recordCotOrphanMarker(ds, target));
+      ref => { target.activityCard = ref; recordCotOrphanMarker(ds, target); });
     return;
   }
   const c = getBotClient(ds.larkAppId);

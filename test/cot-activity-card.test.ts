@@ -10,7 +10,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
-import { activitySummary, buildActivityCard, updateActivityCard, showActivityPage, type ActivityEvent } from '../src/im/lark/cot-activity-card.js';
+import { activitySummary, buildActivityCard, updateActivityCard, showActivityPage, handleActivityPageAction, type ActivityEvent } from '../src/im/lark/cot-activity-card.js';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
 
 const ev = (event_type: string, data: unknown): ActivityEvent => ({ event_type, content: JSON.stringify(data), timestamp: 100 });
@@ -288,5 +288,71 @@ describe('activity card lifecycle', () => {
     await sweepOrphanCotMessages('app');
     await sweepOrphanCotMessages('app');
     expect(writes()).toHaveLength(count);
+  });
+
+  it('returns an afterAck publisher without updating the card during the callback', async () => {
+    update('history');
+    await drain(() => existsSync(join(directory(), 'card-card1.json'))
+      && JSON.parse(readFileSync(join(directory(), 'card-card1.json'), 'utf8')).messageId === 'om_card1');
+    const before = writes().length;
+    const response = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 0, false);
+    expect(response).toEqual({ afterAck: expect.any(Function) });
+    expect(writes()).toHaveLength(before);
+    await response.afterAck();
+    expect(writes()).toHaveLength(before + 1);
+  });
+
+  it('repairs a lost message binding only after verifying provider ownership and entity mapping', async () => {
+    const normal = request.getMockImplementation()!;
+    let mapping = 'other-card';
+    request.mockImplementation(async r => {
+      if (r.url.endsWith('/reply')) throw new Error('response lost after accepted');
+      if (r.method === 'GET') return { code: 0, data: { items: [{ message_id: 'om_card1', chat_id: 'oc_chat', sender: { id: 'app', sender_type: 'app' }, deleted: false }] } };
+      if (r.url.endsWith('/id_convert')) return { code: 0, data: { card_id: mapping } };
+      return normal(r);
+    });
+    update('a'.repeat(40_000) + ' LAST PAGE');
+    await drain(() => sends().length === 1);
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    await drain(() => !existsSync(join(directory(), 'card-card1.json')));
+    await expect(showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 999, false)).rejects.toThrow('mapping');
+    mapping = 'card1';
+    await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 999, false);
+    const saved = JSON.parse(readFileSync(join(config.session.dataDir, 'cot-activity/app/card1.json'), 'utf8'));
+    expect(saved.messageId).toBe('om_card1');
+    expect(JSON.stringify(lastCard('card1'))).toContain('LAST PAGE');
+    expect(sends()).toHaveLength(1);
+  });
+
+  it('serializes startup recovery with paging on the same entity', async () => {
+    mkdirSync(directory(), { recursive: true });
+    mkdirSync(join(config.session.dataDir, 'cot-activity/app'), { recursive: true });
+    for (const cardId of ['recovery1', 'recovery2']) {
+      const ref = { appId: 'app', chatId: 'oc_chat', cardId, messageId: `om_${cardId}`, sequence: 5, events: eventHistory, retired: false };
+      writeFileSync(join(directory(), `card-${cardId}.json`), JSON.stringify({ larkAppId: 'app', cotId: `card-${cardId}`, messageId: ref.messageId, activityCard: ref }));
+      writeFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), JSON.stringify(ref));
+    }
+    const normal = request.getMockImplementation()!;
+    let releaseFirst!: (value: unknown) => void;
+    let releasePage!: (value: unknown) => void;
+    request.mockImplementation(async r => {
+      if (r.method === 'PUT' && r.url.endsWith('/recovery1')) return new Promise(resolve => { releaseFirst = resolve; });
+      if (r.method === 'PUT' && r.url.endsWith('/recovery2') && r.data.sequence === 6) return new Promise(resolve => { releasePage = resolve; });
+      return normal(r);
+    });
+    const recovery = sweepOrphanCotMessages('app');
+    await drain(() => !!releaseFirst);
+    const page = showActivityPage('app', 'om_recovery2', 'oc_chat', 'recovery2', 0, false);
+    await drain(() => !!releasePage);
+    releaseFirst({ code: 0, data: {} });
+    for (let i = 0; i < 80; i++) await Promise.resolve();
+    expect(writes().filter(r => r.url.endsWith('/recovery2')).map(r => r.data.sequence)).toEqual([6]);
+    releasePage({ code: 0, data: {} });
+    await Promise.all([page, recovery]);
+    expect(writes().filter(r => r.url.endsWith('/recovery2')).map(r => r.data.sequence)).toEqual([6, 7]);
+    const saved = JSON.parse(readFileSync(join(config.session.dataDir, 'cot-activity/app/recovery2.json'), 'utf8'));
+    expect(saved).toMatchObject({ sequence: 7, retired: true });
+    expect(saved.sequenceConflict).not.toBe(true);
   });
 });

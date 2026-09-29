@@ -25,20 +25,35 @@ export interface ActivityCardRef {
 }
 
 const liveRefs = new Map<string, ActivityCardRef>();
+const writers = new Map<string, Promise<void>>();
+function identity(appId: string, cardId: string): string {
+  return `${config.session.dataDir}:${appId}:${cardId}`;
+}
+function canonicalRef(appId: string, candidate: ActivityCardRef): ActivityCardRef {
+  const key = identity(appId, candidate.cardId);
+  const existing = liveRefs.get(key);
+  if (existing) return existing;
+  candidate.appId = appId;
+  liveRefs.set(key, candidate);
+  return candidate;
+}
 function recordPath(ref: Pick<ActivityCardRef, 'appId' | 'cardId'>): string {
   if (!ref.appId || !/^[A-Za-z0-9_-]+$/.test(ref.appId) || !/^[A-Za-z0-9_-]+$/.test(ref.cardId)) throw new Error('Invalid activity identity');
   return join(config.session.dataDir, 'cot-activity', ref.appId, `${ref.cardId}.json`);
 }
 export function persistActivityCard(ref: ActivityCardRef): void {
   if (!ref.appId) return;
+  const key = identity(ref.appId, ref.cardId);
+  const existing = liveRefs.get(key);
+  if (existing && existing !== ref) throw new Error('Activity card must use its canonical entity');
   const path = recordPath(ref);
   mkdirSync(join(config.session.dataDir, 'cot-activity', ref.appId), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, JSON.stringify(ref), { mode: 0o600, followTargetSymlink: false });
-  liveRefs.set(`${ref.appId}:${ref.cardId}`, ref);
+  liveRefs.set(key, ref);
   // Active records keep their exact writer object; finished records can be
   // read from disk after eviction without retaining every turn in memory.
   if (liveRefs.size > 128) for (const [key, value] of liveRefs) {
-    if (value.retired && !writers.has(value)) liveRefs.delete(key);
+    if (value.retired && !writers.has(key)) liveRefs.delete(key);
     if (liveRefs.size <= 128) break;
   }
 }
@@ -46,9 +61,11 @@ export function persistActivityCard(ref: ActivityCardRef): void {
 type ActivityItem = { kind: 'text' | 'tool' | 'result'; text: string; toolName?: string };
 
 export function readActivityCard(appId: string, cardId: string): ActivityCardRef | undefined {
+  const existing = liveRefs.get(identity(appId, cardId));
+  if (existing) return existing;
   try {
     const ref = JSON.parse(readFileSync(recordPath({ appId, cardId }), 'utf8')) as ActivityCardRef;
-    return ref.appId === appId && ref.cardId === cardId ? ref : undefined;
+    return ref.appId === appId && ref.cardId === cardId ? canonicalRef(appId, ref) : undefined;
   } catch { return undefined; }
 }
 
@@ -165,6 +182,9 @@ export async function createActivityCard(
   if (typeof data?.card_id !== 'string' || !data.card_id) throw new Error('Activity card missing card_id');
   const ref: ActivityCardRef = { cardId: data.card_id, messageId: '', sequence: 0, events: [...initialEvents], retired: false,
     appId, chatId, publishUuid: randomUUID() };
+  // A newly-created provider entity owns a new identity. Register it before
+  // publication so every update, callback and recovery uses this same object.
+  liveRefs.set(identity(appId, ref.cardId), ref);
   onEntity(ref); // must durably save identity + history before visible publication
   persistActivityCard(ref);
   // Install paging controls once the entity id is known, before publication.
@@ -189,12 +209,13 @@ export async function createActivityCard(
   return ref;
 }
 
-const writers = new WeakMap<ActivityCardRef, Promise<void>>();
 export async function updateActivityCard(
   appId: string, ref: ActivityCardRef, events: readonly ActivityEvent[], retired: boolean, english: boolean,
-  checkpoint: () => void, selectedPage?: number,
+  checkpoint: (ref: ActivityCardRef) => void, selectedPage?: number,
 ): Promise<void> {
-  const previous = writers.get(ref) ?? Promise.resolve();
+  ref = canonicalRef(appId, ref);
+  const key = identity(appId, ref.cardId);
+  const previous = writers.get(key) ?? Promise.resolve();
   const work = previous.catch(() => {}).then(async () => {
     if (ref.sequenceConflict) throw new Error('Activity card sequence conflicts with remote state');
     if (selectedPage !== undefined) ref.page = selectedPage;
@@ -205,7 +226,7 @@ export async function updateActivityCard(
     ref.sequence++;
     ref.pendingEvents = next;
     ref.pendingRetired = terminal;
-    checkpoint();
+    checkpoint(ref);
     persistActivityCard(ref);
     try {
       await request(appId, { method: 'PUT', url: `/open-apis/cardkit/v1/cards/${encodeURIComponent(ref.cardId)}`,
@@ -213,7 +234,7 @@ export async function updateActivityCard(
     } catch (error) {
       if (((error as { code?: number }).code ?? (error as { response?: { data?: { code?: number } } }).response?.data?.code) === 300317) {
         ref.sequenceConflict = true;
-        checkpoint(); persistActivityCard(ref);
+        checkpoint(ref); persistActivityCard(ref);
       }
       throw error;
     }
@@ -221,25 +242,50 @@ export async function updateActivityCard(
     ref.pendingEvents = undefined;
     ref.pendingRetired = undefined;
     ref.retired = terminal;
-    checkpoint();
+    checkpoint(ref);
     persistActivityCard(ref);
   });
-  writers.set(ref, work);
-  try { await work; } finally { if (writers.get(ref) === work) writers.delete(ref); }
+  writers.set(key, work);
+  try { await work; } finally { if (writers.get(key) === work) writers.delete(key); }
 }
 
 /** Read-only paging: the callback may only address its own published card in
  * the same app/chat. It never dispatches an agent or forwards transcript text. */
 export async function showActivityPage(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean): Promise<void> {
+  const ref = await validateActivityPage(appId, messageId, chatId, cardId, page);
+  await updateActivityCard(appId, ref, [], ref.retired, english, persistActivityCard, page);
+}
+
+async function validateActivityPage(appId: string, messageId: string, chatId: string, cardId: string, page: number): Promise<ActivityCardRef> {
   if (!Number.isSafeInteger(page) || page < 0) throw new Error('Invalid activity page');
-  let ref = liveRefs.get(`${appId}:${cardId}`);
-  if (!ref) {
-    ref = readActivityCard(appId, cardId);
-    if (!ref) throw new Error('Activity card unavailable');
-    liveRefs.set(`${appId}:${cardId}`, ref);
-  }
-  if (ref.appId !== appId || ref.cardId !== cardId || !messageId || ref.messageId !== messageId || !chatId || ref.chatId !== chatId) {
+  const ref = readActivityCard(appId, cardId);
+  if (!ref || ref.appId !== appId || ref.cardId !== cardId || !messageId || !chatId || ref.chatId !== chatId) {
     throw new Error('Activity card identity mismatch');
   }
-  await updateActivityCard(appId, ref, [], ref.retired, english, () => persistActivityCard(ref!), page);
+  if (!ref.messageId) {
+    // A trusted click supplies the visible message, but never trust its
+    // client-controlled value.card_id. Verify both ownership/chat and the
+    // provider's message -> entity mapping before repairing a lost response.
+    const message = await request(appId, { method: 'GET', url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}` });
+    const item = message?.items?.find((item: any) => item.message_id === messageId);
+    if (item?.chat_id !== chatId || item?.sender?.id !== appId || item?.sender?.sender_type !== 'app' || item?.deleted) {
+      throw new Error('Activity card message ownership mismatch');
+    }
+    const mapped = await request(appId, { method: 'POST', url: '/open-apis/cardkit/v1/cards/id_convert', data: { message_id: messageId } });
+    if (mapped?.card_id !== cardId) throw new Error('Activity card mapping mismatch');
+    // No await between recheck and the durable binding. Concurrent clicks
+    // must agree on the same provider-confirmed message.
+    if (ref.messageId && ref.messageId !== messageId) throw new Error('Activity card identity mismatch');
+    ref.messageId = messageId;
+    persistActivityCard(ref);
+  }
+  if (ref.messageId !== messageId) throw new Error('Activity card identity mismatch');
+  return ref;
+}
+
+export async function handleActivityPageAction(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean) {
+  await validateActivityPage(appId, messageId, chatId, cardId, page);
+  // The dispatcher recognizes this envelope as an empty ACK and executes the
+  // fresh publisher afterward. Returning {} here would be an empty raw card.
+  return { afterAck: () => showActivityPage(appId, messageId, chatId, cardId, page, english) };
 }

@@ -1188,9 +1188,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const chatId = data?.context?.open_chat_id;
     if (!operatorOpenId || !cardMessageId || !chatId) return { toast: { type: 'error', content: '无法确认活动卡片来源' } };
     try {
-      const { showActivityPage } = await import('./cot-activity-card.js');
-      await showActivityPage(larkAppId, cardMessageId, chatId, String(value.card_id ?? ''), Number(value.page), localeForBot(larkAppId) === 'en');
-      return {};
+      const { handleActivityPageAction } = await import('./cot-activity-card.js');
+      return await handleActivityPageAction(larkAppId, cardMessageId, chatId, String(value.card_id ?? ''), Number(value.page), localeForBot(larkAppId) === 'en');
     } catch {
       return { toast: { type: 'error', content: '无法加载该页，请稍后重试' } };
     }

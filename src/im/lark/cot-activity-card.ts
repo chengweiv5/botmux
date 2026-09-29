@@ -182,20 +182,31 @@ export function buildActivityCard(events: readonly ActivityEvent[], retired: boo
   const items = itemsFrom(events);
   const last = items.at(-1);
   const summary = activitySummary(events, english);
-  if (retired && !navigation?.expanded) {
-    const text = { tag: 'div', margin: '0px', text: {
-      tag: 'plain_text', content: `${navigation ? '› ' : ''}${summary.replace(/\s+/g, ' ')}`,
+  const historyText = { tag: 'div', margin: '0px', text: {
+      tag: 'plain_text', content: summary,
       text_color: 'grey', text_size: 'normal', lines: 1,
-    } };
-    // An ended segment is one line, not a collapsed panel with default header
-    // padding. Details are rendered only after an explicit click.
-    return stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0',
-      config: { update_multi: true, width_mode: 'default', summary: { content: summary } },
-      body: { padding: '0px', vertical_spacing: '0px', elements: navigation ? [{
+  } };
+  // Keep the summary itself plain and reserve a fixed-width control on the
+  // right. A 20px text control avoids a regular button's minimum padding;
+  // flex_mode=none keeps it beside the truncated text on narrow screens too.
+  const historyHeader = navigation ? {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '8px', margin: '0px',
+    columns: [
+      { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', padding: '0px', elements: [historyText] },
+      { tag: 'column', width: english ? '64px' : '40px', vertical_align: 'center', padding: '0px', elements: [{
         tag: 'interactive_container', width: 'fill', height: '20px', padding: '0px', margin: '0px', has_border: false,
-        behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_toggle', card_id: navigation.cardId, expanded: true } }],
-        elements: [text],
-      }] : [text] },
+        behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_toggle', card_id: navigation.cardId, expanded: !navigation.expanded } }],
+        elements: [{ tag: 'div', margin: '0px', text: { tag: 'plain_text',
+          content: navigation.expanded ? (english ? 'Collapse' : '收起') : (english ? 'Expand' : '展开'),
+          text_color: 'grey', text_size: 'normal', text_align: 'right', lines: 1 } }],
+      }] },
+    ],
+  } : historyText;
+  if (retired && !navigation?.expanded) {
+    // Details are rendered only after an explicit click on the right control.
+    return stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0',
+      config: { update_multi: true, width_mode: 'compact', summary: { content: summary } },
+      body: { padding: '0px', vertical_spacing: '0px', elements: [historyHeader] },
     }));
   }
   const lastText = last?.kind === 'text' ? last.text.replace(/\s+/g, ' ').trim() : '';
@@ -221,23 +232,23 @@ export function buildActivityCard(events: readonly ActivityEvent[], retired: boo
   pages.push(chunk);
   const page = Math.min(Math.max(0, navigation?.page ?? 0), pages.length - 1);
   const detail = pages[page];
-  const title = retired ? `<font color='grey'>${plain(summary)}</font>` : plain(live);
   const pageButtons = pages.length > 1 && navigation ? [{ tag: 'column_set', columns: [
     { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { tag: 'plain_text', content: english ? 'Previous' : '上一页' }, disabled: page === 0,
       behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_page', card_id: navigation.cardId, page: page - 1 } }] }] },
     { tag: 'column', width: 'auto', elements: [{ tag: 'button', text: { tag: 'plain_text', content: english ? 'Next' : '下一页' }, disabled: page === pages.length - 1,
       behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_page', card_id: navigation.cardId, page: page + 1 } }] }] },
   ] }] : [];
-  const collapseButton = retired && navigation ? [{ tag: 'button', text: { tag: 'plain_text', content: english ? 'Collapse' : '收起' },
-    behaviors: [{ type: 'callback', value: { action: 'get_cot_activity_toggle', card_id: navigation.cardId, expanded: false } }] }] : [];
-  const card = stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'default', summary: { content: retired ? summary : live } },
-    body: { padding: '4px 8px 4px 8px', elements: [{
-      tag: 'collapsible_panel', expanded: retired, padding: '0px',
-      header: { title: { tag: 'markdown', content: title },
-        icon: { tag: 'standard_icon', token: 'down_outlined', color: retired ? 'grey' : 'blue', size: '16px 16px' },
+  const details = [
+    { tag: 'markdown', content: `<font color='grey'>${english ? 'Full activity record for this turn' : '本轮完整活动记录'}${pages.length > 1 ? ` · ${page + 1}/${pages.length}` : ''}</font>` },
+    { tag: 'markdown', text_size: 'notation', content: detail }, ...pageButtons,
+  ];
+  const card = stampBotmuxCallbackMarkers(JSON.stringify({ schema: '2.0', config: { update_multi: true, width_mode: 'compact', summary: { content: retired ? summary : live } },
+    body: retired ? { padding: '0px', elements: [historyHeader, ...details] } : { padding: '4px 8px 4px 8px', elements: [{
+      tag: 'collapsible_panel', expanded: false, padding: '0px',
+      header: { title: { tag: 'markdown', content: `<font color='grey'>${plain(live)}</font>` },
+        icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey', size: '16px 16px' },
         icon_position: 'follow_text', icon_expanded_angle: -180 },
-      elements: [{ tag: 'markdown', content: `<font color='grey'>${english ? 'Full activity record for this turn' : '本轮完整活动记录'}${pages.length > 1 ? ` · ${page + 1}/${pages.length}` : ''}</font>` },
-        { tag: 'markdown', content: detail }, ...pageButtons, ...collapseButton],
+      elements: details,
     }] } }));
   if (Buffer.byteLength(JSON.stringify({ card: { type: 'card_json', data: card }, sequence: 2147483647 }), 'utf8') > 30_000) {
     throw new Error('Activity card exceeds byte budget');

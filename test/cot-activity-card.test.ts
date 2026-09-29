@@ -15,8 +15,8 @@ import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrph
 
 const isOneLineHistory = (card: any): boolean => {
   const element = card.body.elements[0];
-  const row = element.tag === 'interactive_container' ? element.elements[0] : element;
-  return card.body.padding === '0px' && row.tag === 'div' && row.text.tag === 'plain_text'
+  const row = element.tag === 'column_set' ? element.columns[0].elements[0] : element;
+  return card.body.elements.length === 1 && card.body.padding === '0px' && row.tag === 'div' && row.text.tag === 'plain_text'
     && row.text.lines === 1 && row.text.text_color === 'grey';
 };
 
@@ -30,6 +30,8 @@ describe('activity card presentation', () => {
   it('uses a gray concrete action summary without implying task completion', () => {
     const card = JSON.parse(buildActivityCard(eventHistory, true));
     expect(isOneLineHistory(card)).toBe(true);
+    expect(card.config.width_mode).toBe('compact');
+    expect(card.header).toBeUndefined();
     expect(card.body.elements[0].text.content).toBe('本段记录：读取文件 1 次，运行命令 1 次');
     expect(card.body.elements).toHaveLength(1);
     expect(JSON.stringify(card)).not.toMatch(/任务已完成|Completed|done_outlined/);
@@ -44,14 +46,14 @@ describe('activity card presentation', () => {
   ] as const)('never reuses ongoing or future narrative as a finished summary (english=%s)', (english, narrative, summary) => {
     const events = [ev('REASONING_MESSAGE_CONTENT', { delta: narrative })];
     const collapsed = JSON.parse(buildActivityCard(events, true, english, { cardId: 'history' }));
-    expect(collapsed.body.elements[0].elements[0].text.content).toBe(`› ${summary}`);
+    expect(collapsed.body.elements[0].columns[0].elements[0].text.content).toBe(summary);
     expect(collapsed.config.summary.content).toBe(summary);
     expect(JSON.stringify(collapsed)).not.toContain(narrative);
 
     const expanded = JSON.parse(buildActivityCard(events, true, english, { cardId: 'history', expanded: true }));
-    expect(expanded.body.elements[0].header.title.content).toBe(`<font color='grey'>${summary}</font>`);
+    expect(expanded.body.elements[0].columns[0].elements[0].text.content).toBe(summary);
     expect(expanded.config.summary.content).toBe(summary);
-    expect(expanded.body.elements[0].elements[1].content).toBe(narrative);
+    expect(expanded.body.elements[2].content).toBe(narrative);
     const live = JSON.parse(buildActivityCard(events, false, english));
     expect(live.config.summary.content).toBe(narrative);
   });
@@ -59,19 +61,22 @@ describe('activity card presentation', () => {
   it('shows a live operation and preserves earlier records in the expanded body', () => {
     const card = JSON.parse(buildActivityCard(eventHistory.slice(0, -1), false));
     expect(card.body.elements[0].header.title.content).toContain('正在执行命令');
+    expect(card.config.width_mode).toBe('compact');
+    expect(card.header).toBeUndefined();
+    expect(card.body.elements[0].header.icon.color).toBe('grey');
     expect(JSON.stringify(card)).toContain('Inspect access controls&#46;');
     expect(JSON.stringify(card)).toContain('本轮完整活动记录');
   });
 
   it('does not label a returned tool result as still executing', () => {
     const card = JSON.parse(buildActivityCard(eventHistory, false));
-    expect(card.body.elements[0].header.title.content).toBe('正在处理…');
+    expect(card.body.elements[0].header.title.content).toBe("<font color='grey'>正在处理…</font>");
   });
 
   it('does not turn transcript text into mentions, HTML or links', () => {
     const raw = '<at id=all></at> [secret](https://example.com) <font color=red>text</font>';
     const card = buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: raw })], true, false, { cardId: 'escaped', expanded: true });
-    const detail = JSON.parse(card).body.elements[0].elements[1].content;
+    const detail = JSON.parse(card).body.elements[2].content;
     expect(detail).toContain('&#60;at');
     expect(detail).not.toContain('<at');
     expect(detail).not.toContain('[secret]');
@@ -82,10 +87,10 @@ describe('activity card presentation', () => {
     const card = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', expanded: true }));
     expect(Buffer.byteLength(JSON.stringify({ card: { type: 'card_json', data: JSON.stringify(card) }, sequence: 2147483647 }))).toBeLessThanOrEqual(30000);
     let rebuilt = '';
-    const total = Number(card.body.elements[0].elements[0].content.match(/1\/(\d+)/)[1]);
+    const total = Number(card.body.elements[1].content.match(/1\/(\d+)/)[1]);
     for (let page = 0; page < total; page++) {
       const next = JSON.parse(buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: text })], true, false, { cardId: 'pages', page, expanded: true }));
-      rebuilt += next.body.elements[0].elements[1].content;
+      rebuilt += next.body.elements[2].content;
       expect(Buffer.byteLength(JSON.stringify(next))).toBeLessThan(30000);
     }
     expect(rebuilt).toBe(text);
@@ -96,16 +101,16 @@ describe('activity card presentation', () => {
     expect(card).not.toContain('已完成');
     expect(activitySummary([], true)).toBe('Activity record');
     const empty = JSON.parse(buildActivityCard([], true, false, { cardId: 'empty', expanded: true }));
-    expect(empty.body.elements[0].elements[1].content).toBe('本段无可展示的活动内容。');
+    expect(empty.body.elements[2].content).toBe('本段无可展示的活动内容。');
     expect(JSON.stringify(empty)).not.toMatch(/等待|正在/);
     const live = JSON.parse(buildActivityCard([eventHistory[2], ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'text', text: '✓ 已完成' }) })], false));
-    expect(live.body.elements[0].header.title.content).toBe('正在处理…');
+    expect(live.body.elements[0].header.title.content).toBe("<font color='grey'>正在处理…</font>");
   });
 
   it('renders raw tables and other block syntax as literal text', () => {
     const text = '| a | b |\n|---|---|\n|1|2|\n\n'.repeat(5) + '---\n- list\n1. item\n:DONE:\n    indented';
     const card = JSON.parse(buildActivityCard([ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'code', code: text }) })], true, false, { cardId: 'literal', expanded: true }));
-    const detail = card.body.elements[0].elements[1].content;
+    const detail = card.body.elements[2].content;
     const tokens = new MarkdownIt().parse(detail, {});
     expect(tokens.some(t => ['table_open', 'hr', 'bullet_list_open', 'ordered_list_open', 'code_block'].includes(t.type))).toBe(false);
     expect(detail).toContain('&#124;');
@@ -227,7 +232,7 @@ describe('activity card lifecycle', () => {
     await sweepOrphanCotMessages('app');
     await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 0, false);
     expect(JSON.stringify(lastCard('card1'))).toContain('last saved step');
-    expect(lastCard('card1').body.elements[0].header.title.content).toContain("color='grey'");
+    expect(lastCard('card1').body.elements[0].columns[0].elements[0].text.text_color).toBe('grey');
   });
 
   it('does not reactivate a card after a failed retirement request', async () => {
@@ -341,16 +346,26 @@ describe('activity card lifecycle', () => {
     await drain(() => !existsSync(join(directory(), 'card-card1.json')));
     const compact = lastCard('card1');
     expect(isOneLineHistory(compact)).toBe(true);
-    expect(compact.body.elements[0]).toMatchObject({ height: '20px', padding: '0px', margin: '0px', has_border: false });
-    expect(compact.body.elements[0].elements).toHaveLength(1);
+    const header = compact.body.elements[0];
+    expect(header).toMatchObject({ tag: 'column_set', flex_mode: 'none', margin: '0px' });
+    expect(header.columns).toHaveLength(2);
+    expect(header.columns[0]).toMatchObject({ width: 'weighted', weight: 1 });
+    expect(header.columns[0].elements[0].text.content).toBe('本段活动记录');
+    const control = header.columns[1].elements[0];
+    expect(control).toMatchObject({ height: '20px', padding: '0px', margin: '0px', has_border: false });
+    expect(control.elements[0].text.content).toBe('展开');
+    expect(control.behaviors[0].value).toMatchObject({ action: 'get_cot_activity_toggle', card_id: 'card1', expanded: true });
     expect(JSON.stringify(compact)).not.toContain('collapsible_panel');
     expect(JSON.stringify(compact)).not.toContain('本轮完整活动记录');
 
     const expand = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 0, false, true);
     expect(isOneLineHistory(lastCard('card1'))).toBe(true);
     await expand.afterAck();
-    expect(lastCard('card1').body.elements[0].expanded).toBe(true);
-    expect(lastCard('card1').body.elements[0].elements[1].content).toBe('Full detail '.repeat(100));
+    expect(isOneLineHistory(lastCard('card1'))).toBe(false);
+    const expandedControl = lastCard('card1').body.elements[0].columns[1].elements[0];
+    expect(expandedControl.elements[0].text.content).toBe('收起');
+    expect(expandedControl.behaviors[0].value.expanded).toBe(false);
+    expect(lastCard('card1').body.elements[2].content).toBe('Full detail '.repeat(100));
     const collapse = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 0, false, false);
     await collapse.afterAck();
     expect(isOneLineHistory(lastCard('card1'))).toBe(true);
@@ -434,7 +449,7 @@ describe('activity card lifecycle', () => {
     expect(published.data.sequence).toBe(sequence + 1);
     expect(isOneLineHistory(JSON.parse(published.data.card.data))).toBe(true);
     await showActivityPage('app', ref.messageId, 'oc_chat', cardId, 0, false);
-    const detail = lastCard(cardId).body.elements[0].elements[1].content;
+    const detail = lastCard(cardId).body.elements[2].content;
     expect(detail).toBe('a\n\nb');
     expect(existsSync(marker)).toBe(false);
     const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), 'utf8'));

@@ -972,6 +972,13 @@ describe('activity bubble follows completed deliveries', () => {
   const deletes = () => request.mock.calls.filter(([r]) => r.method === 'DELETE');
   const forBubble = (id: string) => request.mock.calls.filter(([r]) => r.method === 'PUT' && r.data.cot_id === id)
     .flatMap(([r]) => r.data.events);
+  /** Releasing a held request queues several promise continuations. Advancing
+   * fake timers does not drain that chain equally under Bun and Vitest. Wait
+   * for the observable request boundary without moving the cooldown clock. */
+  const flushRequestsUntil = async (completed: () => boolean): Promise<void> => {
+    for (let i = 0; i < 100 && !completed(); i++) await Promise.resolve();
+    expect(completed()).toBe(true);
+  };
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1152,7 +1159,7 @@ describe('activity bubble follows completed deliveries', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     handleCotThinkingUpdate(ds, upd([think('a'), think('b')]));
     release({ code: 0 });
-    await vi.advanceTimersByTimeAsync(1);
+    await flushRequestsUntil(() => request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1')));
     expect(forBubble('cot2').filter((e: any) => JSON.parse(e.content).delta === 'b')).toHaveLength(1);
     expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(false);
   });
@@ -1173,7 +1180,9 @@ describe('activity bubble follows completed deliveries', () => {
     if (reason === 'shutdown') await settleCotMessageForShutdown(ds);
     if (reason === 'superseded') handleCotThinkingUpdate(ds, upd([think('next')], 'om_turn2'));
     release({ code: 0 });
-    await vi.advanceTimersByTimeAsync(1);
+    await flushRequestsUntil(() => reason === 'shutdown'
+      ? request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot2'))
+      : forBubble('cot2').some((e: any) => e.event_type === 'RUN_FINISHED'));
     expect(deletes()).toEqual([]);
     expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
     expect(forBubble('cot2').some((e: any) => JSON.parse(e.content).delta === 'a')).toBe(true);
@@ -1257,6 +1266,7 @@ describe('activity bubble follows completed deliveries', () => {
     appendDelivery();
     await vi.advanceTimersByTimeAsync(2_000);
     release({ code: 0 });
+    await flushRequestsUntil(() => !existsSync(join(orphanDir, 'cot1.json')));
     await vi.advanceTimersByTimeAsync(4_999);
     expect(creates()).toHaveLength(2);
     await vi.advanceTimersByTimeAsync(1);

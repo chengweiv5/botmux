@@ -14,11 +14,15 @@ export class CotSendObserver {
   private inode = '';
   private tail = '';
   private seen = new Set<string>();
+  /** False means this read only scanned a prefix (or an incomplete last row).
+   * Callers must not interpret an empty batch as proof no final was sent. */
+  caughtUp = false;
 
   constructor(private path: string, private turnId: string, private dispatchAttempt?: number) {}
 
   read(): CotDelivery[] {
     let fd: number | undefined;
+    this.caughtUp = false;
     try {
       fd = openSync(this.path, 'r');
       const stat = fstatSync(fd);
@@ -28,7 +32,10 @@ export class CotSendObserver {
         this.tail = '';
         this.inode = inode;
       }
-      if (stat.size === this.offset) return [];
+      if (stat.size === this.offset) {
+        this.caughtUp = this.tail.length === 0;
+        return [];
+      }
       // A marker contains at most a bounded preview; do not let a corrupted
       // journal allocate arbitrary memory or pin a daemon event loop.
       const length = Math.min(stat.size - this.offset, 256 * 1024);
@@ -38,6 +45,7 @@ export class CotSendObserver {
       const lines = (this.tail + buffer.toString('utf8', 0, count)).split('\n');
       this.tail = lines.pop() ?? '';
       if (this.tail.length > 32_768) this.tail = '';
+      this.caughtUp = this.offset >= stat.size && this.tail.length === 0;
       const result: CotDelivery[] = [];
       for (const line of lines) {
         try {
@@ -55,6 +63,9 @@ export class CotSendObserver {
         } catch { /* partial/corrupt/legacy row */ }
       }
       return result;
-    } catch { return []; } finally { if (fd !== undefined) closeSync(fd); }
+    } catch (error) {
+      this.caughtUp = (error as NodeJS.ErrnoException).code === 'ENOENT';
+      return [];
+    } finally { if (fd !== undefined) closeSync(fd); }
   }
 }

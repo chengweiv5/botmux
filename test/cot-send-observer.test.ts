@@ -18,8 +18,10 @@ describe('CotSendObserver', () => {
     const line = marker();
     writeFileSync(path, line.slice(0, -5));
     expect(reader.read()).toEqual([]);
+    expect(reader.caughtUp).toBe(false);
     appendFileSync(path, line.slice(-5));
     expect(reader.read()).toEqual([{ messageId: 'om_reply1', deliveredAtMs: 100, final: false }]);
+    expect(reader.caughtUp).toBe(true);
     expect(reader.read()).toEqual([]);
     appendFileSync(path, line);
     expect(reader.read()).toEqual([]);

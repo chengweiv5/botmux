@@ -1210,4 +1210,91 @@ describe('activity bubble follows completed deliveries', () => {
     expect(request.mock.calls.filter(([r]) => r.url.includes('/complete/')).map(([r]) => r.url))
       .toEqual(['/open-apis/im/v1/message_cot/complete/cot1', '/open-apis/im/v1/message_cot/complete/cot2']);
   });
+
+  it('retains the new bubble recovery marker when old shutdown returns after a failed completion', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    let releaseReplay!: (value: unknown) => void;
+    let releaseShutdown!: (value: unknown) => void;
+    request.mockImplementation(async r => {
+      if (r.method === 'PUT' && r.data.cot_id === 'cot2' && !releaseReplay) {
+        return new Promise(resolve => { releaseReplay = resolve; });
+      }
+      if (r.method === 'PUT' && r.data.cot_id === 'cot1'
+        && r.data.events.some((e: any) => e.event_type === 'RUN_FINISHED')) {
+        return new Promise(resolve => { releaseShutdown = resolve; });
+      }
+      if (r.url.endsWith('/complete/cot2')) return { code: 999 };
+      return normal(r);
+    });
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const shutdown = settleCotMessageForShutdown(ds);
+    await flush();
+    releaseReplay({ code: 0 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(existsSync(join(orphanDir, 'cot2.json'))).toBe(true);
+    releaseShutdown({ code: 0 });
+    await shutdown;
+    expect(existsSync(join(orphanDir, 'cot2.json'))).toBe(true);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('applies the cooldown to progress queued while a migration is in flight', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    let release!: (value: unknown) => void;
+    const createTimes: number[] = [];
+    request.mockImplementation(async r => {
+      if (r.method === 'POST' && r.url.endsWith('/message_cot')) createTimes.push(Date.now());
+      if (r.method === 'PUT' && r.data.cot_id === 'cot2' && !release) return new Promise(resolve => { release = resolve; });
+      return normal(r);
+    });
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    release({ code: 0 });
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(creates()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(creates()).toHaveLength(3);
+    expect(createTimes[1] - createTimes[0]).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it('reads a final behind a large journal before creating any bubble', async () => {
+    const old = JSON.stringify({ turnId: 'old', messageId: 'om_old', sentAtMs: 1,
+      responseKind: 'progress', previewText: 'x'.repeat(4000) }) + '\n';
+    writeFileSync(journal, old.repeat(300));
+    appendDelivery('final');
+    handleCotThinkingUpdate(ds, upd([think('late')]));
+    await flush();
+    expect(creates()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(creates()).toHaveLength(0);
+  });
+
+  it('eventually creates after asynchronously catching up a long journal without a final', async () => {
+    const old = JSON.stringify({ turnId: 'old', messageId: 'om_old', previewText: 'x'.repeat(4000) }) + '\n';
+    writeFileSync(journal, old.repeat(300));
+    handleCotThinkingUpdate(ds, upd([think('current')]));
+    await flush();
+    expect(creates()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(creates()).toHaveLength(1);
+    expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'current')).toBe(true);
+  });
+
+  it('finishes draining when terminal arrives before a long journal is caught up', async () => {
+    const old = JSON.stringify({ turnId: 'old', messageId: 'om_old', previewText: 'x'.repeat(4000) }) + '\n';
+    writeFileSync(journal, old.repeat(600));
+    handleCotThinkingUpdate(ds, upd([think('current')]));
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(creates()).toHaveLength(1);
+    expect(forBubble('cot1').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

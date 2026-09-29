@@ -33,6 +33,10 @@
  *      complete call is needed; the explicit complete endpoint is kept as the
  *      error-path fallback so a failed terminal batch can't leave the bubble
  *      spinning forever.
+ *   4. Completed in-session sends move the active bubble below the reply:
+ *      replay confirmed display events, switch the writer, then recall the
+ *      previous message. Coalesce bursts; migration failures leave the old
+ *      bubble intact, recall failures disable further movement for this turn.
  *
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
@@ -51,9 +55,12 @@ import { logger } from '../../utils/logger.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
+import { CotSendObserver } from '../../services/cot-send-observer.js';
 
 /** Bounds every CoT HTTP call so a hung endpoint can't pin the pump. */
 const COT_REQUEST_TIMEOUT_MS = 15_000;
+const COT_FOLLOW_DEBOUNCE_MS = 1_200;
+const COT_FOLLOW_MIN_INTERVAL_MS = 5_000;
 
 interface CotEvent {
   event_type: string;
@@ -81,6 +88,16 @@ interface CotState {
   pumping: boolean;
   /** Set when turn_terminal arrives; consumed by the pump's final flush. */
   finishStatus?: 'done' | 'interrupted';
+  /** Confirmed display events, including their original redaction decisions.
+   * Replaying these must not reveal previously hidden tool output. */
+  history: CotEvent[];
+  observer: CotSendObserver;
+  followTimer?: ReturnType<typeof setInterval>;
+  createdAtMs?: number;
+  moveDueAtMs?: number;
+  lastMoveAtMs?: number;
+  migrationDisabled?: boolean;
+  finalDelivered?: boolean;
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
@@ -113,6 +130,7 @@ function rememberRecentState(ds: DaemonSession, state: CotState): void {
  * 曾经推送失败（disabled），走显式 complete 让它停止转圈。
  */
 function settleSupersededState(ds: DaemonSession, state: CotState): void {
+  stopFollowing(state);
   if (state.settled) return;
   if (state.disabled) {
     if (state.cotId) {
@@ -157,6 +175,39 @@ function recordCotOrphanMarker(ds: DaemonSession, state: CotState): void {
 function clearCotOrphanMarker(state: CotState): void {
   if (!state.cotId) return;
   try { unlinkSync(join(cotOrphanDir(), `${state.cotId}.json`)); } catch { /* already gone */ }
+}
+
+function stopFollowing(state: CotState): void {
+  clearInterval(state.followTimer);
+  state.followTimer = undefined;
+  state.moveDueAtMs = undefined;
+}
+
+/** Reading the existing per-session journal also works for sandboxed senders:
+ * no new writable directory, IPC capability or reply-routing authority. */
+function observeDeliveries(ds: DaemonSession, state: CotState): void {
+  for (const delivery of state.observer.read()) {
+    if (delivery.final) {
+      state.finalDelivered = true;
+      state.finishStatus ??= 'done';
+      stopFollowing(state);
+    } else if (!state.finalDelivered && !state.migrationDisabled && state.createdAtMs !== undefined
+      && delivery.deliveredAtMs >= state.createdAtMs) {
+      state.moveDueAtMs = Math.max(Date.now() + COT_FOLLOW_DEBOUNCE_MS,
+        (state.lastMoveAtMs ?? 0) + COT_FOLLOW_MIN_INTERVAL_MS);
+    }
+  }
+  if (ds.session.status === 'closed' || states.get(ds) !== state || !cotEnabled(ds)) stopFollowing(state);
+}
+
+function startFollowing(ds: DaemonSession, state: CotState): void {
+  state.followTimer = setInterval(() => {
+    observeDeliveries(ds, state);
+    if (state.finishStatus || (state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs)) {
+      void pump(ds, state);
+    }
+  }, 500);
+  state.followTimer.unref();
 }
 
 /**
@@ -337,6 +388,7 @@ function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?:
 
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
   const c = getBotClient(ds.larkAppId);
+  state.createdAtMs = Date.now();
   const res = await c.request({
     method: 'POST',
     url: '/open-apis/im/v1/message_cot',
@@ -361,24 +413,81 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
-    await c.request({
+    const result = await c.request({
       method: 'PUT',
       url: '/open-apis/im/v1/message_cot',
       data: { cot_id: state.cotId, message_id: state.messageId, events: events.slice(i, i + 50) },
       timeout: COT_REQUEST_TIMEOUT_MS,
     } as any);
+    if (result?.code !== undefined && result.code !== 0) throw new Error(`AppendCOT failed: ${result.code}`);
   }
 }
 
 /** Best-effort error-path completion (normal completion rides RUN_FINISHED). */
 async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 'error'): Promise<void> {
   const c = getBotClient(ds.larkAppId);
-  await c.request({
+  const result = await c.request({
     method: 'POST',
     url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(state.cotId!)}`,
     params: { message_id: state.messageId!, reason },
     timeout: COT_REQUEST_TIMEOUT_MS,
   } as any);
+  if (result?.code !== undefined && result.code !== 0) throw new Error(`CompleteCOT failed: ${result.code}`);
+}
+
+/** Retire only a CoT created by this module. Leave an orphan marker whenever
+ * both recall and completion fail, so restart recovery can stop its spinner. */
+async function retireBubble(ds: DaemonSession, state: CotState): Promise<boolean> {
+  if (!state.cotId || !state.messageId) return true;
+  try {
+    const result = await getBotClient(ds.larkAppId).request({
+      method: 'DELETE', url: `/open-apis/im/v1/messages/${encodeURIComponent(state.messageId)}`,
+      timeout: COT_REQUEST_TIMEOUT_MS,
+    } as any);
+    if (result?.code !== 0) throw new Error(`RecallCOT failed: ${result?.code}`);
+    clearCotOrphanMarker(state);
+    return true;
+  } catch (err) {
+    logger.warn(`[cot] recall failed msg=${state.messageId}: ${err instanceof Error ? err.message : String(err)}`);
+    try { await apiComplete(ds, state, 'done'); clearCotOrphanMarker(state); } catch { /* orphan sweep retries */ }
+    return false;
+  }
+}
+
+/** Runs under the pump's single-writer lock. The old bubble remains authoritative
+ * until the replacement has acknowledged every previously displayed event. */
+async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> {
+  state.moveDueAtMs = undefined;
+  const canMove = () => !state.disabled && !state.settled && !state.finishStatus && !state.migrationDisabled
+    && states.get(ds) === state && ds.session.status !== 'closed' && cotEnabled(ds);
+  if (!canMove()) return;
+  const replacement: CotState = { ...state, cotId: undefined, messageId: undefined, followTimer: undefined };
+  try {
+    await apiCreate(ds, replacement);
+    recordCotOrphanMarker(ds, replacement);
+    observeDeliveries(ds, state);
+    if (!canMove()) { await retireBubble(ds, replacement); return; }
+    await apiAppend(ds, replacement, state.history);
+    observeDeliveries(ds, state);
+    if (!canMove()) { await retireBubble(ds, replacement); return; }
+
+    const previous: CotState = { ...state };
+    state.cotId = replacement.cotId;
+    state.messageId = replacement.messageId;
+    state.createdAtMs = replacement.createdAtMs;
+    state.lastMoveAtMs = Date.now();
+    if (!await retireBubble(ds, previous)) {
+      // One completed duplicate is preferable to accumulating another bubble
+      // on every progress message when the tenant cannot recall CoT messages.
+      state.migrationDisabled = true;
+      state.moveDueAtMs = undefined;
+    }
+  } catch (err) {
+    state.migrationDisabled = true;
+    state.moveDueAtMs = undefined;
+    if (replacement.cotId) await retireBubble(ds, replacement);
+    logger.warn(`[cot] migration disabled, preserving current bubble: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** One reasoning message (= one rendered node) per thinking entry. */
@@ -571,9 +680,16 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
 async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   if (state.pumping) return;
   state.pumping = true;
+  const sessionClosed = () => ds.session.status === 'closed';
   try {
     while (!state.disabled) {
+      observeDeliveries(ds, state);
       if (!state.cotId) {
+        if (state.finalDelivered || state.settled || sessionClosed()) {
+          state.settled = true;
+          stopFollowing(state);
+          break;
+        }
         await apiCreate(ds, state);
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts
@@ -581,10 +697,19 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         // recording it after the append would leave a markerless window where
         // a created-but-never-settled bubble spins forever.
         recordCotOrphanMarker(ds, state);
-        await apiAppend(ds, state, [
+        observeDeliveries(ds, state);
+        if (state.finalDelivered || state.settled || sessionClosed()) {
+          await retireBubble(ds, state);
+          state.settled = true;
+          stopFollowing(state);
+          break;
+        }
+        const prologue = [
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
-        ]);
+        ];
+        await apiAppend(ds, state, prologue);
+        state.history.push(...prologue);
         logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 24)}`);
       }
       const pending = state.pendingEntries;
@@ -597,8 +722,13 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           batch.push(...entryEvents(ds, state, pending[i], i));
         }
         await apiAppend(ds, state, batch);
+        state.history.push(...batch);
         state.sentCount = pending.length;
         continue; // re-check for newer entries queued during the push
+      }
+      if (!state.finishStatus && state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs) {
+        await migrateBubble(ds, state);
+        continue;
       }
       if (state.finishStatus && !state.settled) {
         await apiAppend(ds, state, [
@@ -606,6 +736,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: state.finishStatus }),
         ]);
         state.settled = true;
+        stopFollowing(state);
         clearCotOrphanMarker(state);
         logger.info(`[cot] finished cot=${state.cotId} turn=${state.turnId.substring(0, 24)} status=${state.finishStatus}`);
       }
@@ -613,6 +744,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
     }
   } catch (err) {
     state.disabled = true;
+    stopFollowing(state);
     logger.warn(`[cot] disabled for turn ${state.turnId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
     // If the entity exists but the terminal batch failed, the bubble would
     // spin forever — close it out via the explicit complete endpoint.
@@ -625,7 +757,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   } finally {
     state.pumping = false;
     // Work queued while we were failing/finishing a batch above.
-    if (!state.disabled && (state.pendingEntries !== undefined || (state.finishStatus && !state.settled))) {
+    if (!state.disabled && !state.settled && (state.pendingEntries !== undefined || state.finishStatus)) {
       void pump(ds, state);
     }
   }
@@ -661,10 +793,13 @@ export function handleCotThinkingUpdate(
       settled: false,
       sentCount: 0,
       pumping: false,
+      history: [],
+      observer: new CotSendObserver(join(config.session.dataDir, 'turn-sends', `${ds.session.sessionId}.jsonl`), msg.turnId, msg.dispatchAttempt),
     };
     states.set(ds, state);
     rememberRecentState(ds, state);
   }
+  if (!state.followTimer) startFollowing(ds, state);
   state.pendingEntries = msg.entries;
   void pump(ds, state);
   return true;
@@ -689,6 +824,7 @@ export function handleCotThinkingUpdate(
 export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<void> {
   const state = states.get(ds);
   if (!state || state.settled || !state.cotId) return;
+  stopFollowing(state);
   // A turn that is already finishing owns its own terminal batch: `pump` may be
   // parked on an await with its `!state.settled` check already passed, so
   // claiming the turn here would put a SECOND RUN_FINISHED on the wire (caught
@@ -722,6 +858,7 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
 export function abortCotMessage(ds: DaemonSession): void {
   const state = states.get(ds);
   if (!state || state.settled) return;
+  stopFollowing(state);
   if (state.disabled) {
     if (state.cotId) {
       state.settled = true;
@@ -752,6 +889,7 @@ export function finalizeCotMessage(
   // 收过，这里靠 finishStatus / settled 幂等）。
   if (!state || state.turnId !== turnId) state = recentStates.get(ds)?.get(turnId);
   if (!state || state.turnId !== turnId) return false;
+  stopFollowing(state);
   if (state.disabled) {
     // A mid-turn push failure left the bubble unfinished (disabled before
     // finishStatus was set). Close it here rather than letting it spin until

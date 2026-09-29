@@ -9972,6 +9972,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             sentAtMs,
             messageId,
             responseKind: effectiveResponseKind,
+            cotDelivery: { deliveredAtMs: Date.now() },
             ...(originTurnId ? { turnId: originTurnId } : {}),
             ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           };
@@ -10506,19 +10507,21 @@ async function cmdSend(rest: string[]): Promise<void> {
     await revalidateIsolatedOriginBeforeEffect();
     return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
-  const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
+  const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string, deliveryComplete = false, followOnly = false): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
       const marker: Record<string, unknown> = {
-        sentAtMs,
+        ...(followOnly ? {} : { sentAtMs }),
         messageId,
         responseKind: effectiveResponseKind,
+        ...(!unifiedReplyUsed && deliveryComplete ? { cotDelivery: { deliveredAtMs: Date.now() } } : {}),
+        ...(!unifiedReplyUsed && !deliveryComplete && effectiveResponseKind === 'final' ? { cotFinal: true } : {}),
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
       };
-      Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
+      if (!followOnly) Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
       appendFileSync(join(markerDir, `${sid}.jsonl`), line);
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
@@ -11203,10 +11206,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // sends can suppress transcript fallback when their content appears to
     // cover the same final answer; detoured sends suppress only when they
     // closed a pending response card for this turn.
-    if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+    const hasSeparateAttachments = files.length > 0 || videoAttachments.length > 0;
+    if (hasSeparateAttachments && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
       recordBridgeSendMarker(sentAtMs, messageId, text);
     }
-
     // Send attachments as separate messages — best-effort. The primary message
     // is already delivered above; a failing attachment must not throw out to the
     // catch below (which would report total failure / exit 1 for an already-sent
@@ -11223,6 +11226,11 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+    }
+    // Move the activity bubble only after the entire delivery (including
+    // attachments) finishes, while retaining the original fallback time window.
+    if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+      recordBridgeSendMarker(sentAtMs, messageId, text, true, hasSeparateAttachments);
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);

@@ -8,7 +8,7 @@
  * simply not displayed), and the error-path explicit complete when the
  * terminal batch fails.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const request = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({
@@ -16,7 +16,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: vi.fn(() => ({ request })),
 }));
 
-import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
@@ -956,5 +956,232 @@ describe('superseded turn (type-ahead: next turn starts before the previous one 
     const complete = request.mock.calls.find(([req]) => typeof req.url === 'string' && req.url.includes('/message_cot/complete/'));
     expect(complete).toBeDefined();
     expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
+  });
+});
+
+
+describe('activity bubble follows completed deliveries', () => {
+  let ds: ReturnType<typeof makeDs>;
+  let sequence: number;
+  const journal = join(dataDir, 'turn-sends', 's1.jsonl');
+  const appendDelivery = (kind = 'progress', extra: Record<string, unknown> = {}) => {
+    appendFileSync(journal, JSON.stringify({ turnId: 'om_turn1', messageId: `om_reply_${Date.now()}`,
+      sentAtMs: Date.now(), responseKind: kind, cotDelivery: { deliveredAtMs: Date.now() }, ...extra }) + '\n');
+  };
+  const creates = () => request.mock.calls.filter(([r]) => r.method === 'POST' && r.url.endsWith('/message_cot'));
+  const deletes = () => request.mock.calls.filter(([r]) => r.method === 'DELETE');
+  const forBubble = (id: string) => request.mock.calls.filter(([r]) => r.method === 'PUT' && r.data.cot_id === id)
+    .flatMap(([r]) => r.data.events);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    ds = makeDs();
+    sequence = 0;
+    mkdirSync(join(dataDir, 'turn-sends'), { recursive: true });
+    writeFileSync(journal, '');
+    request.mockImplementation(async r => {
+      if (r.method === 'POST' && r.url.endsWith('/message_cot')) {
+        sequence++;
+        return { code: 0, data: { cot_id: `cot${sequence}`, message_id: `om_cot${sequence}` } };
+      }
+      return { code: 0, data: {} };
+    });
+  });
+  afterEach(async () => {
+    abortCotMessage(ds);
+    await flush();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    rmSync(journal, { force: true });
+  });
+
+  it('replays full confirmed history before recall, then appends new work only to the replacement', async () => {
+    handleCotThinkingUpdate(ds, upd([say('first'), think('second')]));
+    await flush();
+    const original = forBubble('cot1');
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(creates()).toHaveLength(2);
+    expect(forBubble('cot2')).toEqual(original);
+    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot1']);
+    const replayIndex = request.mock.calls.findIndex(([r]) => r.method === 'PUT' && r.data.cot_id === 'cot2');
+    const recallIndex = request.mock.calls.findIndex(([r]) => r.method === 'DELETE');
+    expect(recallIndex).toBeGreaterThan(replayIndex);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    expect(existsSync(join(orphanDir, 'cot2.json'))).toBe(true);
+    request.mockClear();
+    handleCotThinkingUpdate(ds, upd([say('first'), think('second'), say('third')]));
+    await flush();
+    expect(forBubble('cot1')).toEqual([]);
+    expect(forBubble('cot2').some((e: any) => JSON.parse(e.content).delta === 'third')).toBe(true);
+  });
+
+  it('coalesces a burst of sends and ignores duplicate or unrelated markers', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    appendDelivery('progress', { messageId: 'om_same' });
+    await vi.advanceTimersByTimeAsync(500);
+    appendDelivery('progress', { messageId: 'om_same' });
+    appendDelivery('progress', { messageId: 'om_other', turnId: 'om_otherturn' });
+    appendDelivery('progress', { messageId: 'om_attempt', dispatchAttempt: 2 });
+    appendDelivery('progress', { messageId: 'om_legacy', cotDelivery: undefined });
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(creates()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(creates()).toHaveLength(2);
+  });
+
+  it('keeps original bubble updating when replay returns a nonzero API code', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => r.method === 'PUT' && r.data.cot_id === 'cot2'
+      ? { code: 999, msg: 'replay refused' } : normal(r));
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
+    handleCotThinkingUpdate(ds, upd([think('a'), think('b')]));
+    await flush();
+    expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(true);
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(creates()).toHaveLength(2);
+  });
+
+  it('stops moving after recall fails and completes the duplicate', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => r.method === 'DELETE' ? { code: 230011 } : normal(r));
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(creates()).toHaveLength(2);
+    handleCotThinkingUpdate(ds, upd([think('a'), think('b')]));
+    await flush();
+    expect(forBubble('cot2').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(true);
+  });
+
+  it('finishes the existing bubble after a final answer and cancels a pending move', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(500);
+    appendDelivery('final');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(creates()).toHaveLength(1);
+    expect(forBubble('cot1').filter((e: any) => e.event_type === 'RUN_FINISHED')).toHaveLength(1);
+    handleCotThinkingUpdate(ds, upd([think('a'), think('late')]));
+    await flush();
+    expect(creates()).toHaveLength(1);
+  });
+
+  it('removes an in-flight replacement when a final answer arrives during create', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    let finishCreate!: (value: unknown) => void;
+    request.mockImplementation(async r => {
+      if (r.method === 'POST' && r.url.endsWith('/message_cot')) return new Promise(resolve => { finishCreate = resolve; });
+      return normal(r);
+    });
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    appendDelivery('final');
+    finishCreate({ code: 0, data: { cot_id: 'cot2', message_id: 'om_cot2' } });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
+    expect(forBubble('cot2')).toEqual([]);
+    expect(forBubble('cot1').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
+  });
+
+  it('keeps hidden output hidden while replaying after display preferences change', async () => {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, thinkingCardToolResult: false } } as any);
+    const entries = [think('a'), { kind: 'tool_call', id: 'tool1', name: 'Bash', args: '{}' },
+      { kind: 'tool_result', id: 'tool1', result: 'sensitive-result' }];
+    handleCotThinkingUpdate(ds, upd(entries));
+    await flush();
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, thinkingCardToolResult: true } } as any);
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(forBubble('cot2').length).toBeGreaterThan(0);
+    expect(JSON.stringify(forBubble('cot2'))).not.toContain('sensitive-result');
+  });
+
+  it('does not create a bubble when a final delivery is already journaled', async () => {
+    appendDelivery('final');
+    handleCotThinkingUpdate(ds, upd([think('late')]));
+    await flush();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(creates()).toHaveLength(0);
+  });
+
+  it('retains orphan markers when both recall and completion fail', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    request.mockImplementation(async r => r.method === 'DELETE' || r.url.includes('/complete/')
+      ? { code: 999 } : normal(r));
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    expect(existsSync(join(orphanDir, 'cot2.json'))).toBe(true);
+  });
+
+  it('drains updates arriving during replay onto the replacement without losing records', async () => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    let release!: (value: unknown) => void;
+    let held = false;
+    request.mockImplementation(async r => {
+      if (r.method === 'PUT' && r.data.cot_id === 'cot2' && !held) {
+        held = true;
+        return new Promise(resolve => { release = resolve; });
+      }
+      return normal(r);
+    });
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    handleCotThinkingUpdate(ds, upd([think('a'), think('b')]));
+    release({ code: 0 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(forBubble('cot2').filter((e: any) => JSON.parse(e.content).delta === 'b')).toHaveLength(1);
+    expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(false);
+  });
+
+  it.each(['terminal', 'abort', 'shutdown', 'superseded'])('cancels an in-flight move on %s', async reason => {
+    handleCotThinkingUpdate(ds, upd([think('a')]));
+    await flush();
+    const normal = request.getMockImplementation()!;
+    let release!: (value: unknown) => void;
+    request.mockImplementation(async r => {
+      if (r.method === 'PUT' && r.data.cot_id === 'cot2') return new Promise(resolve => { release = resolve; });
+      return normal(r);
+    });
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    if (reason === 'terminal') finalizeCotMessage(ds, 'om_turn1', 'completed');
+    if (reason === 'abort') abortCotMessage(ds);
+    if (reason === 'shutdown') await settleCotMessageForShutdown(ds);
+    if (reason === 'superseded') handleCotThinkingUpdate(ds, upd([think('next')], 'om_turn2'));
+    release({ code: 0 });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
+    expect(forBubble('cot1').filter((e: any) => e.event_type === 'RUN_FINISHED')).toHaveLength(1);
+  });
+
+  it('replays large histories in API-sized batches', async () => {
+    handleCotThinkingUpdate(ds, upd(Array.from({ length: 50 }, (_, i) => think(`step ${i}`))));
+    await vi.advanceTimersByTimeAsync(1);
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(forBubble('cot2')).toEqual(forBubble('cot1'));
+    const batches = request.mock.calls.filter(([r]) => r.method === 'PUT' && r.data.cot_id === 'cot2');
+    expect(batches).toHaveLength(4);
+    expect(batches.every(([r]) => r.data.events.length <= 50)).toBe(true);
   });
 });

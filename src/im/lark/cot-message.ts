@@ -203,7 +203,8 @@ function observeDeliveries(ds: DaemonSession, state: CotState): void {
 function startFollowing(ds: DaemonSession, state: CotState): void {
   state.followTimer = setInterval(() => {
     observeDeliveries(ds, state);
-    if (state.finishStatus || (state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs)) {
+    if (state.finishStatus || (state.observer.caughtUp && (state.pendingEntries !== undefined
+      || (state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs)))) {
       void pump(ds, state);
     }
   }, 500);
@@ -453,6 +454,11 @@ async function retireBubble(ds: DaemonSession, state: CotState): Promise<boolean
 /** Runs under the pump's single-writer lock. The old bubble remains authoritative
  * until the replacement has acknowledged every previously displayed event. */
 async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> {
+  const earliest = (state.lastMoveAtMs ?? 0) + COT_FOLLOW_MIN_INTERVAL_MS;
+  if (Date.now() < earliest) {
+    state.moveDueAtMs = Math.max(state.moveDueAtMs ?? 0, earliest);
+    return;
+  }
   state.moveDueAtMs = undefined;
   const canMove = () => !state.disabled && !state.settled && !state.finishStatus && !state.migrationDisabled
     && states.get(ds) === state && ds.session.status !== 'closed' && cotEnabled(ds);
@@ -486,6 +492,9 @@ async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> 
     state.messageId = replacement.messageId;
     state.createdAtMs = replacement.createdAtMs;
     state.lastMoveAtMs = Date.now();
+    if (state.moveDueAtMs !== undefined) {
+      state.moveDueAtMs = Math.max(state.moveDueAtMs, state.lastMoveAtMs + COT_FOLLOW_MIN_INTERVAL_MS);
+    }
     if (!canMove() && !state.finishStatus && !state.settled) state.finishStatus = 'interrupted';
     if (!await retireBubble(ds, previous)) {
       // Avoid accumulating more live spinners when completion is unavailable.
@@ -692,9 +701,16 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   if (state.pumping) return;
   state.pumping = true;
   const sessionClosed = () => ds.session.status === 'closed';
+  let waitingForJournal = false;
   try {
     while (!state.disabled) {
       observeDeliveries(ds, state);
+      if (!state.observer.caughtUp && !state.finalDelivered) {
+        // The interval drains the journal in bounded chunks. Yield rather
+        // than synchronously recursing through a long session's history.
+        waitingForJournal = true;
+        break;
+      }
       if (!state.cotId) {
         if (state.finalDelivered || state.settled || sessionClosed()) {
           state.settled = true;
@@ -767,8 +783,10 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
     }
   } finally {
     state.pumping = false;
+    if (waitingForJournal && !state.disabled && !state.settled && !state.followTimer
+      && !sessionClosed() && cotEnabled(ds)) startFollowing(ds, state);
     // Work queued while we were failing/finishing a batch above.
-    if (!state.disabled && !state.settled && (state.pendingEntries !== undefined || state.finishStatus)) {
+    if (!waitingForJournal && !state.disabled && !state.settled && (state.pendingEntries !== undefined || state.finishStatus)) {
       void pump(ds, state);
     }
   }
@@ -843,20 +861,25 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
   // marker, so nothing is left spinning — leave it alone.
   if (state.finishStatus) return;
   state.settled = true; // claim it: a concurrent abort/finalize must not double-send
+  // Migration may replace state.cotId while this request is awaiting Lark.
+  // Both the fallback request and marker cleanup must retain the original id.
+  const target = { ...state };
+  let completed = false;
   try {
-    if (!state.disabled) {
-      await apiAppend(ds, state, interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId));
+    if (!target.disabled) {
+      await apiAppend(ds, target, interruptedNoticeEvents(ds.larkAppId, target.lastReasoningId));
     } else {
       // A mid-turn failure already disabled pushes for this turn; appending
       // would fail too. Just terminate so it stops spinning.
-      await apiComplete(ds, state, 'error');
+      await apiComplete(ds, target, 'error');
     }
+    completed = true;
   } catch {
     // Notice failed — still terminate, for the same reason the sweep does:
     // an unannotated closed bubble beats one that spins forever.
-    try { await apiComplete(ds, state, 'error'); } catch { /* best-effort */ }
+    try { await apiComplete(ds, target, 'error'); completed = true; } catch { /* orphan sweep retries */ }
   } finally {
-    clearCotOrphanMarker(state);
+    if (completed) clearCotOrphanMarker(target);
   }
 }
 

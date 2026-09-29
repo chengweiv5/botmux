@@ -705,16 +705,17 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   try {
     while (!state.disabled) {
       observeDeliveries(ds, state);
-      if (!state.observer.caughtUp && !state.finalDelivered) {
-        // The interval drains the journal in bounded chunks. Yield rather
-        // than synchronously recursing through a long session's history.
-        waitingForJournal = true;
-        break;
-      }
       if (!state.cotId) {
-        if (state.finalDelivered || state.settled || sessionClosed()) {
+        if (state.finishStatus || state.settled || sessionClosed()) {
           state.settled = true;
           stopFollowing(state);
+          break;
+        }
+        if (!state.observer.caughtUp) {
+          // Only new messages need proof no final is waiting in the journal.
+          // Existing bubbles must keep draining and settling even if a writer
+          // left an incomplete row or the file became unreadable.
+          waitingForJournal = true;
           break;
         }
         await apiCreate(ds, state);
@@ -753,7 +754,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         state.sentCount = pending.length;
         continue; // re-check for newer entries queued during the push
       }
-      if (!state.finishStatus && state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs) {
+      if (state.observer.caughtUp && !state.finishStatus && state.moveDueAtMs !== undefined && Date.now() >= state.moveDueAtMs) {
         await migrateBubble(ds, state);
         continue;
       }

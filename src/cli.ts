@@ -311,6 +311,7 @@ import {
 import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
+  isFinalBridgeSendMarker,
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import {
@@ -9636,7 +9637,26 @@ async function cmdSend(rest: string[]): Promise<void> {
       || originSession.scope !== 'chat' || !originSession.chatId.startsWith('doc:')
       || originSession.cliId === 'codex-app' || exactOriginDispatch
       || isolatedAttestationContext || trustedRelayCtx) return undefined;
-    const pending = Object.entries(originSession.docCommentTargets ?? {});
+    // Explicit final replies may leave their targets behind: the worker
+    // suppresses final_output before the daemon can retire them. Use the same
+    // durable send journal even when the daemon missed the send during restart.
+    // Progress/auxiliary and legacy markers without an exact turn are not proof
+    // of completion and must leave their targets pending.
+    const completedTurns = new Set<string>();
+    try {
+      const markerPath = join(resolveDataDir(), 'turn-sends', `${originSessionId}.jsonl`);
+      for (const line of readFileSync(markerPath, 'utf-8').split('\n')) {
+        try {
+          const marker = JSON.parse(line);
+          if (typeof marker?.sentAtMs === 'number' && isFinalBridgeSendMarker(marker)
+            && typeof marker.turnId === 'string' && marker.turnId) {
+            completedTurns.add(marker.turnId);
+          }
+        } catch { /* skip malformed lines, as the worker's marker reader does */ }
+      }
+    } catch { /* no readable journal means no proof of completed turns */ }
+    const pending = Object.entries(originSession.docCommentTargets ?? {})
+      .filter(([turnId]) => !completedTurns.has(turnId));
     if (pending.length !== 1) return undefined;
     const [turnId, target] = pending[0];
     if (!turnId || target.turnId !== turnId || !target.fileToken || !target.commentId) return undefined;

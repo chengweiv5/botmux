@@ -19,17 +19,16 @@ function runSend(options: {
   mentionBack?: boolean;
   session?: Record<string, unknown>;
   args?: string[];
+  responseKind?: 'progress' | 'final' | 'auxiliary';
+  previousSend?: { turnId: string; responseKind?: 'progress' | 'final' | 'auxiliary' };
+  sendHistory?: Record<string, unknown>[];
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-doc-'));
   const dataDir = join(root, 'data');
   const cliId = options.cliId ?? 'codex';
   try {
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
-    if (options.marker !== false) {
-      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
-        sessionId: 'sid_doc', turnId: options.markerTurn ?? null,
-      }));
-    }
+    const pidMarkerPath = join(dataDir, '.botmux-cli-pids', String(process.pid));
     writeFileSync(join(root, 'bots.json'), JSON.stringify([{
       larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId,
     }]));
@@ -45,9 +44,15 @@ function runSend(options: {
         scope: 'chat', chatType: 'group', chatId: 'oc_other', workingDir: root,
       },
     });
-    const result = spawnSyncTsScript(fixture, [
-      'send', options.mentionBack === false ? '--no-mention' : '--mention-back', '--response-kind', 'final',
-      '缺少电子表格读取权限，请授权后继续。', ...(options.args ?? []),
+    const markerPath = join(dataDir, 'turn-sends', 'sid_doc.jsonl');
+    if (options.sendHistory) {
+      mkdirSync(join(dataDir, 'turn-sends'), { recursive: true });
+      writeFileSync(markerPath, options.sendHistory.map(marker => JSON.stringify(marker)).join('\n') + '\n');
+    }
+    const send = (responseKind: typeof options.responseKind, args: string[] = []) => spawnSyncTsScript(fixture, [
+      'send', options.mentionBack === false ? '--no-mention' : '--mention-back',
+      ...(responseKind ? ['--response-kind', responseKind] : []),
+      '缺少电子表格读取权限，请授权后继续。', ...args,
     ], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
       env: {
@@ -58,13 +63,28 @@ function runSend(options: {
       },
       encoding: 'utf8', timeout: 30_000,
     });
+    let previous;
+    if (options.previousSend) {
+      writeFileSync(pidMarkerPath, JSON.stringify({
+        sessionId: 'sid_doc', turnId: options.previousSend.turnId,
+      }));
+      previous = send(options.previousSend.responseKind);
+    }
+    // A restart removes the old worker marker or reattaches with only a session.
+    if (options.marker === false) {
+      rmSync(pidMarkerPath, { force: true });
+    } else {
+      writeFileSync(pidMarkerPath, JSON.stringify({
+        sessionId: 'sid_doc', turnId: options.markerTurn ?? null,
+      }));
+    }
+    const result = send(options.responseKind ?? 'final', options.args);
     const requests = String(result.stdout).split('\n')
       .filter(line => line.startsWith('CAPTURE_REQUEST='))
       .map(line => JSON.parse(line.slice('CAPTURE_REQUEST='.length)));
-    const markerPath = join(dataDir, 'turn-sends', 'sid_doc.jsonl');
     const sends = existsSync(markerPath)
       ? readFileSync(markerPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
-    return { status: result.status, stdout: String(result.stdout), stderr: String(result.stderr), requests, sends };
+    return { status: result.status, stdout: String(result.stdout), stderr: String(result.stderr), requests, sends, previous };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -87,6 +107,85 @@ describe('real CLI document-comment reply routing', () => {
     })]);
     expect(result.stdout).toContain('"kind":"doc-comment"');
   }, 35_000);
+
+  it.each([true, false])('recovers the second turn after a real final reply and restart (reattached=%s)', marker => {
+    const result = runSend({
+      marker,
+      previousSend: { turnId: target.turnId, responseKind: 'final' },
+      session: { docCommentTargets: {
+        [target.turnId]: target,
+        next_reply: { ...target, turnId: 'next_reply', replyToOpenId: 'ou_next_requester' },
+      } },
+    });
+    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests).toEqual([expect.objectContaining({
+      path: '/open-apis/drive/v1/files/doc_test/comments/comment_test/replies',
+      body: { content: { elements: [
+        { type: 'person', person: { user_id: 'ou_next_requester' } },
+        { type: 'text_run', text_run: { text: ' ' } },
+        { type: 'text_run', text_run: { text: expect.stringContaining('缺少电子表格读取权限') } },
+      ] } },
+    })]);
+    expect(result.sends.map(({ turnId, responseKind }) => ({ turnId, responseKind }))).toEqual([
+      { turnId: 'reply_user', responseKind: 'final' },
+      { turnId: 'next_reply', responseKind: 'final' },
+    ]);
+  }, 70_000);
+
+  it('keeps a turn recoverable after a real default progress send and restart', () => {
+    const result = runSend({ previousSend: { turnId: target.turnId } });
+    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests[0]?.path).toBe('/open-apis/drive/v1/files/doc_test/comments/comment_test/replies');
+    expect(result.sends.map(({ turnId, responseKind }) => ({ turnId, responseKind }))).toEqual([
+      { turnId: 'reply_user', responseKind: 'progress' },
+      { turnId: 'reply_user', responseKind: 'final' },
+    ]);
+  }, 70_000);
+
+  it.each([undefined, 'auxiliary'] as const)('keeps two turns ambiguous after a real %s send', responseKind => {
+    const result = runSend({
+      previousSend: { turnId: target.turnId, responseKind },
+      session: { docCommentTargets: {
+        [target.turnId]: target, next_reply: { ...target, turnId: 'next_reply' },
+      } },
+    });
+    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('cannot resolve the exact document-comment reply target');
+    expect(result.requests).toEqual([]);
+    expect(result.sends).toEqual([expect.objectContaining({
+      turnId: target.turnId, responseKind: responseKind ?? 'progress',
+    })]);
+  }, 70_000);
+
+  it.each([
+    { sentAtMs: 1, turnId: target.turnId },
+    { sentAtMs: 1, responseKind: 'final' },
+    { sentAtMs: 1, responseKind: 'final', turnId: 'unrelated_turn' },
+    { sentAtMs: 1, responseKind: 'FINAL', turnId: target.turnId },
+    { responseKind: 'final', turnId: target.turnId },
+  ])('does not infer completion from an unattributable or non-final marker: %j', marker => {
+    const result = runSend({
+      sendHistory: [marker],
+      session: { docCommentTargets: {
+        [target.turnId]: target, next_reply: { ...target, turnId: 'next_reply' },
+      } },
+    });
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('cannot resolve the exact document-comment reply target');
+    expect(result.requests).toEqual([]);
+    expect(result.sends).toEqual([marker]);
+  }, 35_000);
+
+  it('refuses recovery when the only target already has a final reply', () => {
+    const result = runSend({ previousSend: { turnId: target.turnId, responseKind: 'final' } });
+    expect(result.previous?.status, String(result.previous?.stderr)).toBe(0);
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.requests).toEqual([]);
+    expect(result.sends).toHaveLength(1);
+  }, 70_000);
 
   it('keeps exact-turn comment routing when the marker is available', () => {
     const result = runSend({ markerTurn: 'reply_user' });

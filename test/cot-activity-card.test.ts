@@ -363,4 +363,24 @@ describe('activity card lifecycle', () => {
     expect(saved).toMatchObject({ sequence: 7, retired: true });
     expect(saved.sequenceConflict).not.toBe(true);
   });
+
+  it.each([5, 6])('merges a newer orphan snapshot with reserved sequence %s into the canonical entity', async sequence => {
+    const cardId = `newer-orphan-${sequence}`;
+    const events = [ev('REASONING_MESSAGE_CONTENT', { delta: 'a' })];
+    const ref = { appId: 'app', chatId: 'oc_chat', cardId, messageId: `om_${cardId}`, sequence: 5, events, retired: false };
+    mkdirSync(directory(), { recursive: true });
+    mkdirSync(join(config.session.dataDir, 'cot-activity/app'), { recursive: true });
+    writeFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), JSON.stringify(ref));
+    const orphan = { ...ref, sequence, pendingEvents: [...events, ev('REASONING_MESSAGE_CONTENT', { delta: 'b' })], pendingRetired: true };
+    const marker = join(directory(), `card-${cardId}.json`);
+    writeFileSync(marker, JSON.stringify({ larkAppId: 'app', cotId: `card-${cardId}`, messageId: ref.messageId, activityCard: orphan }));
+    await sweepOrphanCotMessages('app');
+    const published = writes().find(r => r.url.endsWith('/' + cardId));
+    expect(published.data.sequence).toBe(sequence + 1);
+    const detail = JSON.parse(published.data.card.data).body.elements[0].elements[1].content;
+    expect(detail).toBe('a\n\nb');
+    expect(existsSync(marker)).toBe(false);
+    const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), 'utf8'));
+    expect(saved).toMatchObject({ sequence: sequence + 1, retired: true, events: orphan.pendingEvents });
+  });
 });

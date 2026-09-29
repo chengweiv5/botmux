@@ -37,6 +37,41 @@ function canonicalRef(appId: string, candidate: ActivityCardRef): ActivityCardRe
   liveRefs.set(key, candidate);
   return candidate;
 }
+
+/** Merge recovery checkpoints only while holding the entity writer. The
+ * orphan journal is committed before the browsable record, so it can carry a
+ * newer reserved sequence and pending history after a crash between writes. */
+function mergeRecoverySnapshot(ref: ActivityCardRef, candidate: ActivityCardRef): void {
+  if (ref === candidate) return;
+  if (candidate.cardId !== ref.cardId || candidate.appId !== ref.appId
+    || (candidate.chatId && ref.chatId && candidate.chatId !== ref.chatId)
+    || (candidate.messageId && ref.messageId && candidate.messageId !== ref.messageId)) {
+    throw new Error('Activity recovery identity mismatch');
+  }
+  const retired = ref.retired || candidate.retired;
+  const pendingRetired = ref.pendingRetired === true || candidate.pendingRetired === true;
+  const conflict = ref.sequenceConflict === true || candidate.sequenceConflict === true;
+  if (candidate.sequence > ref.sequence) {
+    ref.sequence = candidate.sequence;
+    ref.events = candidate.events;
+    ref.pendingEvents = candidate.pendingEvents;
+    ref.pendingRetired = candidate.pendingRetired;
+    ref.page = candidate.page;
+  } else if (candidate.sequence === ref.sequence) {
+    // At the same sequence the two files may be on opposite sides of the
+    // acknowledgement. Retain the longest cumulative snapshot without
+    // replaying it twice; neither source can erase confirmed newer entries.
+    const currentEvents = ref.pendingEvents ?? ref.events;
+    const candidateEvents = candidate.pendingEvents ?? candidate.events;
+    if (candidateEvents.length > currentEvents.length) ref.pendingEvents = candidateEvents;
+  }
+  ref.messageId ||= candidate.messageId;
+  ref.chatId ??= candidate.chatId;
+  ref.publishUuid ??= candidate.publishUuid;
+  ref.retired = retired;
+  if (pendingRetired) ref.pendingRetired = true;
+  if (conflict) ref.sequenceConflict = true;
+}
 function recordPath(ref: Pick<ActivityCardRef, 'appId' | 'cardId'>): string {
   if (!ref.appId || !/^[A-Za-z0-9_-]+$/.test(ref.appId) || !/^[A-Za-z0-9_-]+$/.test(ref.cardId)) throw new Error('Invalid activity identity');
   return join(config.session.dataDir, 'cot-activity', ref.appId, `${ref.cardId}.json`);
@@ -213,10 +248,12 @@ export async function updateActivityCard(
   appId: string, ref: ActivityCardRef, events: readonly ActivityEvent[], retired: boolean, english: boolean,
   checkpoint: (ref: ActivityCardRef) => void, selectedPage?: number,
 ): Promise<void> {
+  const candidate = ref;
   ref = canonicalRef(appId, ref);
   const key = identity(appId, ref.cardId);
   const previous = writers.get(key) ?? Promise.resolve();
   const work = previous.catch(() => {}).then(async () => {
+    mergeRecoverySnapshot(ref, candidate);
     if (ref.sequenceConflict) throw new Error('Activity card sequence conflicts with remote state');
     if (selectedPage !== undefined) ref.page = selectedPage;
     const next = [...(ref.pendingEvents ?? ref.events), ...events];

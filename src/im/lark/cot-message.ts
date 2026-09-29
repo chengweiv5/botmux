@@ -240,7 +240,7 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         if (rec.activityCard) {
           const appId = rec.larkAppId;
           const durable = readActivityCard(appId, rec.activityCard.cardId);
-          if (durable && durable.sequence >= rec.activityCard.sequence) rec.activityCard = durable;
+          if (durable && durable.sequence > rec.activityCard.sequence) rec.activityCard = durable;
           try {
             await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', ref => {
               rec.activityCard = ref;

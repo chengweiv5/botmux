@@ -284,8 +284,12 @@ async function validateActivityPage(appId: string, messageId: string, chatId: st
 }
 
 export async function handleActivityPageAction(appId: string, messageId: string, chatId: string, cardId: string, page: number, english: boolean) {
-  await validateActivityPage(appId, messageId, chatId, cardId, page);
+  if (!Number.isSafeInteger(page) || page < 0) throw new Error('Invalid activity page');
+  const ref = readActivityCard(appId, cardId);
+  if (!ref || ref.appId !== appId || ref.cardId !== cardId || !messageId || !chatId || ref.chatId !== chatId
+    || (ref.messageId && ref.messageId !== messageId)) throw new Error('Activity card identity mismatch');
   // The dispatcher recognizes this envelope as an empty ACK and executes the
-  // fresh publisher afterward. Returning {} here would be an empty raw card.
+  // fresh publisher afterward. Missing-message verification also runs after
+  // ACK: it can require two provider reads. No remote write precedes proof.
   return { afterAck: () => showActivityPage(appId, messageId, chatId, cardId, page, english) };
 }

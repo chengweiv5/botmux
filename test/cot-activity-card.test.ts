@@ -316,6 +316,10 @@ describe('activity card lifecycle', () => {
     for (let i = 0; i < 80; i++) await Promise.resolve();
     finalizeCotMessage(ds, 'om_turn', 'completed');
     await drain(() => !existsSync(join(directory(), 'card-card1.json')));
+    const beforeVerify = request.mock.calls.length;
+    const ack = await handleActivityPageAction('app', 'om_card1', 'oc_chat', 'card1', 999, false);
+    expect(request.mock.calls).toHaveLength(beforeVerify);
+    await expect(ack.afterAck()).rejects.toThrow('mapping');
     await expect(showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 999, false)).rejects.toThrow('mapping');
     mapping = 'card1';
     await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 999, false);
@@ -333,25 +337,29 @@ describe('activity card lifecycle', () => {
       writeFileSync(join(directory(), `card-${cardId}.json`), JSON.stringify({ larkAppId: 'app', cotId: `card-${cardId}`, messageId: ref.messageId, activityCard: ref }));
       writeFileSync(join(config.session.dataDir, `cot-activity/app/${cardId}.json`), JSON.stringify(ref));
     }
+    // Directory enumeration order differs between Bun and Node. Block the
+    // first card the real sweep will encounter, then page the other one.
+    const [firstId, secondId] = readdirSync(directory()).map(name =>
+      JSON.parse(readFileSync(join(directory(), name), 'utf8')).activityCard.cardId as string);
     const normal = request.getMockImplementation()!;
     let releaseFirst!: (value: unknown) => void;
     let releasePage!: (value: unknown) => void;
     request.mockImplementation(async r => {
-      if (r.method === 'PUT' && r.url.endsWith('/recovery1')) return new Promise(resolve => { releaseFirst = resolve; });
-      if (r.method === 'PUT' && r.url.endsWith('/recovery2') && r.data.sequence === 6) return new Promise(resolve => { releasePage = resolve; });
+      if (r.method === 'PUT' && r.url.endsWith('/' + firstId)) return new Promise(resolve => { releaseFirst = resolve; });
+      if (r.method === 'PUT' && r.url.endsWith('/' + secondId) && r.data.sequence === 6) return new Promise(resolve => { releasePage = resolve; });
       return normal(r);
     });
     const recovery = sweepOrphanCotMessages('app');
     await drain(() => !!releaseFirst);
-    const page = showActivityPage('app', 'om_recovery2', 'oc_chat', 'recovery2', 0, false);
+    const page = showActivityPage('app', `om_${secondId}`, 'oc_chat', secondId, 0, false);
     await drain(() => !!releasePage);
     releaseFirst({ code: 0, data: {} });
     for (let i = 0; i < 80; i++) await Promise.resolve();
-    expect(writes().filter(r => r.url.endsWith('/recovery2')).map(r => r.data.sequence)).toEqual([6]);
+    expect(writes().filter(r => r.url.endsWith('/' + secondId)).map(r => r.data.sequence)).toEqual([6]);
     releasePage({ code: 0, data: {} });
     await Promise.all([page, recovery]);
-    expect(writes().filter(r => r.url.endsWith('/recovery2')).map(r => r.data.sequence)).toEqual([6, 7]);
-    const saved = JSON.parse(readFileSync(join(config.session.dataDir, 'cot-activity/app/recovery2.json'), 'utf8'));
+    expect(writes().filter(r => r.url.endsWith('/' + secondId)).map(r => r.data.sequence)).toEqual([6, 7]);
+    const saved = JSON.parse(readFileSync(join(config.session.dataDir, `cot-activity/app/${secondId}.json`), 'utf8'));
     expect(saved).toMatchObject({ sequence: 7, retired: true });
     expect(saved.sequenceConflict).not.toBe(true);
   });

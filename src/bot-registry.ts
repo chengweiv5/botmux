@@ -2015,6 +2015,8 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
   */
   cotEnabled?: boolean;
+  /** Activity uses neutral gray summaries instead of native completion labels. */
+  cotDisplay?: 'native' | 'activity';
   /** Legacy tool-output preference; false still suppresses result bodies. */
   thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
@@ -3864,6 +3866,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
+      cotDisplay: entry.cotDisplay === 'activity' ? 'activity' : undefined,
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,

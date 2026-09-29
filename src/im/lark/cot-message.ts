@@ -44,8 +44,9 @@
  * Per-bot master switch `cotEnabled` (default ON — only an explicit false
  * disables; per-chat opt-out via `/cot off`).
  */
-import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
@@ -56,6 +57,7 @@ import { localeForBot, t } from '../../i18n/index.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
 import { CotSendObserver } from '../../services/cot-send-observer.js';
+import { createActivityCard, updateActivityCard, type ActivityCardRef } from './cot-activity-card.js';
 
 /** Bounds every CoT HTTP call so a hung endpoint can't pin the pump. */
 const COT_REQUEST_TIMEOUT_MS = 15_000;
@@ -98,6 +100,8 @@ interface CotState {
   lastMoveAtMs?: number;
   migrationDisabled?: boolean;
   finalDelivered?: boolean;
+  display?: 'native' | 'activity';
+  activityCard?: ActivityCardRef;
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
@@ -135,9 +139,7 @@ function settleSupersededState(ds: DaemonSession, state: CotState): void {
   if (state.disabled) {
     if (state.cotId) {
       state.settled = true;
-      apiComplete(ds, state, 'error')
-        .catch(() => { /* best-effort */ })
-        .finally(() => clearCotOrphanMarker(state));
+      completeFailedBubble(ds, state);
     }
     return;
   }
@@ -164,11 +166,12 @@ function cotOrphanDir(): string {
 function recordCotOrphanMarker(ds: DaemonSession, state: CotState): void {
   try {
     mkdirSync(cotOrphanDir(), { recursive: true });
-    writeFileSync(join(cotOrphanDir(), `${state.cotId}.json`), JSON.stringify({
+    atomicWriteFileSync(join(cotOrphanDir(), `${state.cotId}.json`), JSON.stringify({
       larkAppId: ds.larkAppId,
       cotId: state.cotId,
       messageId: state.messageId,
-    }));
+      ...(state.activityCard ? { activityCard: state.activityCard } : {}),
+    }), { mode: 0o600, followTargetSymlink: false });
   } catch { /* cosmetic */ }
 }
 
@@ -229,9 +232,22 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
   for (const f of files) {
     const p = join(cotOrphanDir(), f);
     try {
-      const rec = JSON.parse(readFileSync(p, 'utf8')) as { larkAppId?: string; cotId?: string; messageId?: string };
+      const rec = JSON.parse(readFileSync(p, 'utf8')) as { larkAppId?: string; cotId?: string; messageId?: string; activityCard?: ActivityCardRef };
       if (rec.larkAppId && rec.cotId && rec.messageId) {
         if (rec.larkAppId !== selfLarkAppId) continue; // sibling daemon's marker — leave it
+        if (rec.activityCard) {
+          const appId = rec.larkAppId;
+          try {
+            await updateActivityCard(appId, rec.activityCard, [], true, localeForBot(appId) === 'en', () => {
+              atomicWriteFileSync(p, JSON.stringify(rec), { mode: 0o600, followTargetSymlink: false });
+            });
+          } catch (err) {
+            logger.warn(`[cot] activity recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+            continue; // keep its marker so a later restart can finish it
+          }
+          unlinkSync(p);
+          continue;
+        }
         const c = getBotClient(rec.larkAppId);
         // Annotate BEFORE terminating. Order is forced by the API, not a
         // preference: once a CoT is completed every later append is rejected
@@ -390,6 +406,20 @@ function cotPlacement(ds: DaemonSession, state: CotState): { origin_message_id?:
 async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
   const c = getBotClient(ds.larkAppId);
   state.createdAtMs = Date.now();
+  if (state.display === 'activity') {
+    const owner = states.get(ds);
+    const ref = await createActivityCard(ds.larkAppId, ds.chatId, cotPlacement(ds, state), localeForBot(ds.larkAppId) === 'en', () => {
+      if (owner) observeDeliveries(ds, owner);
+      return states.get(ds) === owner && !owner?.finishStatus && !owner?.settled
+        && !state.finishStatus && ds.session.status !== 'closed' && cotEnabled(ds)
+        && (!ds.currentTurnId || ds.currentTurnId === state.turnId);
+    });
+    if (!ref) { state.settled = true; return; }
+    state.activityCard = ref;
+    state.cotId = `card-${ref.cardId}`;
+    state.messageId = ref.messageId;
+    return;
+  }
   const res = await c.request({
     method: 'POST',
     url: '/open-apis/im/v1/message_cot',
@@ -411,6 +441,12 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
 
 async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[]): Promise<void> {
   if (events.length === 0) return;
+  if (state.activityCard) {
+    const target = { ...state };
+    await updateActivityCard(ds.larkAppId, target.activityCard!, events, false, localeForBot(ds.larkAppId) === 'en',
+      () => recordCotOrphanMarker(ds, target));
+    return;
+  }
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
@@ -426,6 +462,12 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
 
 /** Best-effort error-path completion (normal completion rides RUN_FINISHED). */
 async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 'error'): Promise<void> {
+  if (state.activityCard) {
+    const target = { ...state };
+    await updateActivityCard(ds.larkAppId, target.activityCard!, [], true, localeForBot(ds.larkAppId) === 'en',
+      () => recordCotOrphanMarker(ds, target));
+    return;
+  }
   const c = getBotClient(ds.larkAppId);
   const result = await c.request({
     method: 'POST',
@@ -451,6 +493,12 @@ async function retireBubble(ds: DaemonSession, state: CotState): Promise<boolean
   }
 }
 
+function completeFailedBubble(ds: DaemonSession, state: CotState): void {
+  const target = { ...state };
+  void apiComplete(ds, target, 'error').then(() => clearCotOrphanMarker(target))
+    .catch(() => { /* retain the marker for restart recovery */ });
+}
+
 /** Runs under the pump's single-writer lock. The old bubble remains authoritative
  * until the replacement has acknowledged every previously displayed event. */
 async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> {
@@ -461,12 +509,14 @@ async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> 
   }
   state.moveDueAtMs = undefined;
   const canMove = () => !state.disabled && !state.settled && !state.finishStatus && !state.migrationDisabled
-    && states.get(ds) === state && ds.session.status !== 'closed' && cotEnabled(ds);
+    && states.get(ds) === state && ds.session.status !== 'closed' && cotEnabled(ds)
+    && (state.display !== 'activity' || !ds.currentTurnId || ds.currentTurnId === state.turnId);
   if (!canMove()) return;
-  const replacement: CotState = { ...state, cotId: undefined, messageId: undefined, followTimer: undefined,
+  const replacement: CotState = { ...state, cotId: undefined, messageId: undefined, activityCard: undefined, followTimer: undefined,
     resultLanguages: state.resultLanguages ? new Map(state.resultLanguages) : undefined };
   try {
     await apiCreate(ds, replacement);
+    if (replacement.settled) return;
     recordCotOrphanMarker(ds, replacement);
     // Even if the turn ends during create, the now-visible newest bubble
     // must receive the full snapshot before being completed.
@@ -490,6 +540,7 @@ async function migrateBubble(ds: DaemonSession, state: CotState): Promise<void> 
     const previous: CotState = { ...state };
     state.cotId = replacement.cotId;
     state.messageId = replacement.messageId;
+    state.activityCard = replacement.activityCard;
     state.createdAtMs = replacement.createdAtMs;
     state.lastMoveAtMs = Date.now();
     if (state.moveDueAtMs !== undefined) {
@@ -719,6 +770,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           break;
         }
         await apiCreate(ds, state);
+        if (state.settled) { stopFollowing(state); break; }
         // Record the orphan marker the moment the bubble exists — before the
         // prologue append. If the prologue fails (or the daemon restarts
         // before the turn settles), the next generation can still close it;
@@ -778,9 +830,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
     // spin forever — close it out via the explicit complete endpoint.
     if (state.cotId && state.finishStatus && !state.settled) {
       state.settled = true;
-      apiComplete(ds, state, 'error')
-        .catch(() => { /* best-effort */ })
-        .finally(() => clearCotOrphanMarker(state));
+      completeFailedBubble(ds, state);
     }
   } finally {
     state.pumping = false;
@@ -823,6 +873,7 @@ export function handleCotThinkingUpdate(
       settled: false,
       sentCount: 0,
       pumping: false,
+      display: getBot(ds.larkAppId).config.cotDisplay === 'activity' ? 'activity' : 'native',
       history: [],
       observer: new CotSendObserver(join(config.session.dataDir, 'turn-sends', `${ds.session.sessionId}.jsonl`), msg.turnId, msg.dispatchAttempt),
     };
@@ -897,9 +948,7 @@ export function abortCotMessage(ds: DaemonSession): void {
   if (state.disabled) {
     if (state.cotId) {
       state.settled = true;
-      apiComplete(ds, state, 'error')
-        .catch(() => { /* best-effort */ })
-        .finally(() => clearCotOrphanMarker(state));
+      completeFailedBubble(ds, state);
     }
     return;
   }
@@ -931,9 +980,7 @@ export function finalizeCotMessage(
     // the next daemon restart's orphan sweep.
     if (state.cotId && !state.settled) {
       state.settled = true;
-      apiComplete(ds, state, 'error')
-        .catch(() => { /* best-effort */ })
-        .finally(() => clearCotOrphanMarker(state));
+      completeFailedBubble(ds, state);
     }
     return false;
   }

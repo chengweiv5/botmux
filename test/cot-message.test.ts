@@ -991,12 +991,13 @@ describe('activity bubble follows completed deliveries', () => {
   afterEach(async () => {
     abortCotMessage(ds);
     await flush();
+    expect(deletes()).toEqual([]);
     vi.clearAllTimers();
     vi.useRealTimers();
     rmSync(journal, { force: true });
   });
 
-  it('replays full confirmed history before recall, then appends new work only to the replacement', async () => {
+  it('replays full history before completing the old bubble and keeps both messages', async () => {
     handleCotThinkingUpdate(ds, upd([say('first'), think('second')]));
     await flush();
     const original = forBubble('cot1');
@@ -1004,10 +1005,11 @@ describe('activity bubble follows completed deliveries', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(creates()).toHaveLength(2);
     expect(forBubble('cot2')).toEqual(original);
-    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot1']);
+    expect(deletes()).toEqual([]);
+    expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
     const replayIndex = request.mock.calls.findIndex(([r]) => r.method === 'PUT' && r.data.cot_id === 'cot2');
-    const recallIndex = request.mock.calls.findIndex(([r]) => r.method === 'DELETE');
-    expect(recallIndex).toBeGreaterThan(replayIndex);
+    const completeIndex = request.mock.calls.findIndex(([r]) => r.url.endsWith('/complete/cot1'));
+    expect(completeIndex).toBeGreaterThan(replayIndex);
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
     expect(existsSync(join(orphanDir, 'cot2.json'))).toBe(true);
     request.mockClear();
@@ -1040,7 +1042,8 @@ describe('activity bubble follows completed deliveries', () => {
       ? { code: 999, msg: 'replay refused' } : normal(r));
     appendDelivery();
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
+    expect(deletes()).toEqual([]);
+    expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot2'))).toBe(true);
     handleCotThinkingUpdate(ds, upd([think('a'), think('b')]));
     await flush();
     expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(true);
@@ -1049,11 +1052,11 @@ describe('activity bubble follows completed deliveries', () => {
     expect(creates()).toHaveLength(2);
   });
 
-  it('stops moving after recall fails and completes the duplicate', async () => {
+  it('stops moving when completing the preserved old bubble fails', async () => {
     handleCotThinkingUpdate(ds, upd([think('a')]));
     await flush();
     const normal = request.getMockImplementation()!;
-    request.mockImplementation(async r => r.method === 'DELETE' ? { code: 230011 } : normal(r));
+    request.mockImplementation(async r => r.url.endsWith('/complete/cot1') ? { code: 999 } : normal(r));
     appendDelivery();
     await vi.advanceTimersByTimeAsync(2_000);
     expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
@@ -1079,7 +1082,7 @@ describe('activity bubble follows completed deliveries', () => {
     expect(creates()).toHaveLength(1);
   });
 
-  it('removes an in-flight replacement when a final answer arrives during create', async () => {
+  it('finishes a replacement with full history when a final answer arrives during create', async () => {
     handleCotThinkingUpdate(ds, upd([think('a')]));
     await flush();
     const normal = request.getMockImplementation()!;
@@ -1093,9 +1096,10 @@ describe('activity bubble follows completed deliveries', () => {
     appendDelivery('final');
     finishCreate({ code: 0, data: { cot_id: 'cot2', message_id: 'om_cot2' } });
     await vi.advanceTimersByTimeAsync(500);
-    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
-    expect(forBubble('cot2')).toEqual([]);
-    expect(forBubble('cot1').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
+    expect(deletes()).toEqual([]);
+    expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
+    expect(forBubble('cot2').some((e: any) => JSON.parse(e.content).delta === 'a')).toBe(true);
+    expect(forBubble('cot2').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
   });
 
   it('keeps hidden output hidden while replaying after display preferences change', async () => {
@@ -1119,11 +1123,11 @@ describe('activity bubble follows completed deliveries', () => {
     expect(creates()).toHaveLength(0);
   });
 
-  it('retains orphan markers when both recall and completion fail', async () => {
+  it('retains orphan markers when completion fails', async () => {
     handleCotThinkingUpdate(ds, upd([think('a')]));
     await flush();
     const normal = request.getMockImplementation()!;
-    request.mockImplementation(async r => r.method === 'DELETE' || r.url.includes('/complete/')
+    request.mockImplementation(async r => r.url.includes('/complete/')
       ? { code: 999 } : normal(r));
     appendDelivery();
     await vi.advanceTimersByTimeAsync(2_000);
@@ -1153,13 +1157,13 @@ describe('activity bubble follows completed deliveries', () => {
     expect(forBubble('cot1').some((e: any) => JSON.parse(e.content).delta === 'b')).toBe(false);
   });
 
-  it.each(['terminal', 'abort', 'shutdown', 'superseded'])('cancels an in-flight move on %s', async reason => {
+  it.each(['terminal', 'abort', 'shutdown', 'superseded'])('preserves the complete newest snapshot when interrupted by %s', async reason => {
     handleCotThinkingUpdate(ds, upd([think('a')]));
     await flush();
     const normal = request.getMockImplementation()!;
     let release!: (value: unknown) => void;
     request.mockImplementation(async r => {
-      if (r.method === 'PUT' && r.data.cot_id === 'cot2') return new Promise(resolve => { release = resolve; });
+      if (r.method === 'PUT' && r.data.cot_id === 'cot2' && !release) return new Promise(resolve => { release = resolve; });
       return normal(r);
     });
     appendDelivery();
@@ -1170,8 +1174,12 @@ describe('activity bubble follows completed deliveries', () => {
     if (reason === 'superseded') handleCotThinkingUpdate(ds, upd([think('next')], 'om_turn2'));
     release({ code: 0 });
     await vi.advanceTimersByTimeAsync(1);
-    expect(deletes().map(([r]) => r.url)).toEqual(['/open-apis/im/v1/messages/om_cot2']);
-    expect(forBubble('cot1').filter((e: any) => e.event_type === 'RUN_FINISHED')).toHaveLength(1);
+    expect(deletes()).toEqual([]);
+    expect(request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot1'))).toBe(true);
+    expect(forBubble('cot2').some((e: any) => JSON.parse(e.content).delta === 'a')).toBe(true);
+    expect(reason === 'shutdown'
+      ? request.mock.calls.some(([r]) => r.url.endsWith('/complete/cot2'))
+      : forBubble('cot2').some((e: any) => e.event_type === 'RUN_FINISHED')).toBe(true);
   });
 
   it('replays large histories in API-sized batches', async () => {
@@ -1183,5 +1191,23 @@ describe('activity bubble follows completed deliveries', () => {
     const batches = request.mock.calls.filter(([r]) => r.method === 'PUT' && r.data.cot_id === 'cot2');
     expect(batches).toHaveLength(4);
     expect(batches.every(([r]) => r.data.events.length <= 50)).toBe(true);
+  });
+
+  it('keeps every prior step in the newest bubble across multiple progress messages', async () => {
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await flush();
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(2_000);
+    handleCotThinkingUpdate(ds, upd([think('first'), think('second')]));
+    await flush();
+    appendDelivery();
+    await vi.advanceTimersByTimeAsync(5_000);
+    handleCotThinkingUpdate(ds, upd([think('first'), think('second'), think('third')]));
+    await flush();
+    expect(creates()).toHaveLength(3);
+    expect(forBubble('cot3').filter((e: any) => e.event_type === 'REASONING_MESSAGE_CONTENT')
+      .map((e: any) => JSON.parse(e.content).delta)).toEqual(['first', 'second', 'third']);
+    expect(request.mock.calls.filter(([r]) => r.url.includes('/complete/')).map(([r]) => r.url))
+      .toEqual(['/open-apis/im/v1/message_cot/complete/cot1', '/open-apis/im/v1/message_cot/complete/cot2']);
   });
 });

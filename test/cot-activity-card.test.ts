@@ -30,12 +30,30 @@ describe('activity card presentation', () => {
   it('uses a gray concrete action summary without implying task completion', () => {
     const card = JSON.parse(buildActivityCard(eventHistory, true));
     expect(isOneLineHistory(card)).toBe(true);
-    expect(card.body.elements[0].text.content).toBe('读取文件 1 次，执行命令 1 次');
+    expect(card.body.elements[0].text.content).toBe('本段记录：读取文件 1 次，运行命令 1 次');
     expect(card.body.elements).toHaveLength(1);
     expect(JSON.stringify(card)).not.toMatch(/任务已完成|Completed|done_outlined/);
     const expanded = buildActivityCard(eventHistory, true, false, { cardId: 'history', expanded: true });
     expect(expanded).toContain('Inspect access controls&#46;');
     expect(expanded).toContain('All tests passed&#46;');
+  });
+
+  it.each([
+    [false, '正在处理中，我会继续运行下一步。', '本段活动记录'],
+    [true, 'Processing and working on the next step', 'Activity record'],
+  ] as const)('never reuses ongoing or future narrative as a finished summary (english=%s)', (english, narrative, summary) => {
+    const events = [ev('REASONING_MESSAGE_CONTENT', { delta: narrative })];
+    const collapsed = JSON.parse(buildActivityCard(events, true, english, { cardId: 'history' }));
+    expect(collapsed.body.elements[0].elements[0].text.content).toBe(`› ${summary}`);
+    expect(collapsed.config.summary.content).toBe(summary);
+    expect(JSON.stringify(collapsed)).not.toContain(narrative);
+
+    const expanded = JSON.parse(buildActivityCard(events, true, english, { cardId: 'history', expanded: true }));
+    expect(expanded.body.elements[0].header.title.content).toBe(`<font color='grey'>${summary}</font>`);
+    expect(expanded.config.summary.content).toBe(summary);
+    expect(expanded.body.elements[0].elements[1].content).toBe(narrative);
+    const live = JSON.parse(buildActivityCard(events, false, english));
+    expect(live.config.summary.content).toBe(narrative);
   });
 
   it('shows a live operation and preserves earlier records in the expanded body', () => {
@@ -53,10 +71,10 @@ describe('activity card presentation', () => {
   it('does not turn transcript text into mentions, HTML or links', () => {
     const raw = '<at id=all></at> [secret](https://example.com) <font color=red>text</font>';
     const card = buildActivityCard([ev('REASONING_MESSAGE_CONTENT', { delta: raw })], true, false, { cardId: 'escaped', expanded: true });
-    const title = JSON.parse(card).body.elements[0].header.title.content;
-    expect(title).toContain('&#60;at');
-    expect(title).not.toContain('<at');
-    expect(title).not.toContain('[secret]');
+    const detail = JSON.parse(card).body.elements[0].elements[1].content;
+    expect(detail).toContain('&#60;at');
+    expect(detail).not.toContain('<at');
+    expect(detail).not.toContain('[secret]');
   });
 
   it('keeps long histories complete without exceeding the component limit', () => {
@@ -77,6 +95,9 @@ describe('activity card presentation', () => {
     const card = buildActivityCard([ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'text', text: '✓ 已完成' }) })], true);
     expect(card).not.toContain('已完成');
     expect(activitySummary([], true)).toBe('Activity record');
+    const empty = JSON.parse(buildActivityCard([], true, false, { cardId: 'empty', expanded: true }));
+    expect(empty.body.elements[0].elements[1].content).toBe('本段无可展示的活动内容。');
+    expect(JSON.stringify(empty)).not.toMatch(/等待|正在/);
     const live = JSON.parse(buildActivityCard([eventHistory[2], ev('TOOL_CALL_RESULT', { content: JSON.stringify({ type: 'text', text: '✓ 已完成' }) })], false));
     expect(live.body.elements[0].header.title.content).toBe('正在处理…');
   });
@@ -166,6 +187,7 @@ describe('activity card lifecycle', () => {
     await drain(() => JSON.stringify(lastCard('card1')).includes('saved history'));
     const path = join(directory(), 'card-card1.json');
     await drain(() => readFileSync(path, 'utf8').includes('saved history'));
+    await drain(() => JSON.parse(readFileSync(path, 'utf8')).activityCard.messageId === 'om_card1');
     const saved = JSON.parse(readFileSync(path, 'utf8'));
     abortCotMessage(ds);
     await drain(() => !existsSync(path));
@@ -174,8 +196,9 @@ describe('activity card lifecycle', () => {
     await sweepOrphanCotMessages('app');
     expect(existsSync(path)).toBe(false);
     expect(writes().at(-1).data.sequence).toBeGreaterThan(maxSequence);
-    expect(JSON.stringify(lastCard('card1'))).toContain('saved history');
     expect(isOneLineHistory(lastCard('card1'))).toBe(true);
+    await showActivityPage('app', 'om_card1', 'oc_chat', 'card1', 0, false);
+    expect(JSON.stringify(lastCard('card1'))).toContain('saved history');
   });
 
   it('serializes shutdown and updates without restoring a working title', async () => {

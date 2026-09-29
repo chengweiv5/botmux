@@ -154,7 +154,9 @@ function plain(text: string): string {
     .replace(/\t/g, '&#160;'.repeat(4)).replace(/ {2,}/g, spaces => '&#160;'.repeat(spaces.length));
 }
 
-/** The header describes observed operations, never the overall task outcome. */
+/** Finished-card headers describe recorded tool invocations, not success. They must
+ * never reuse narrative text: it can say "正在处理" or describe a future
+ * plan even though this particular activity segment has already ended. */
 export function activitySummary(events: readonly ActivityEvent[], english = false): string {
   const counts = { read: 0, write: 0, command: 0, search: 0, other: 0 };
   const items = itemsFrom(events);
@@ -169,12 +171,10 @@ export function activitySummary(events: readonly ActivityEvent[], english = fals
   }
   const labels = english
     ? { read: 'file reads', write: 'file edits', command: 'command calls', search: 'searches', other: 'tool calls' }
-    : { read: '读取文件', write: '编辑文件', command: '执行命令', search: '搜索', other: '调用工具' };
+    : { read: '读取文件', write: '编辑文件', command: '运行命令', search: '搜索', other: '调用工具' };
   const summary = (Object.keys(counts) as Array<keyof typeof counts>).filter(key => counts[key])
     .map(key => english ? `${counts[key]} ${labels[key]}` : `${labels[key]} ${counts[key]} 次`).join(english ? ', ' : '，');
-  if (summary) return summary;
-  const text = items.find(item => item.kind === 'text' && item.text.trim())?.text.replace(/\s+/g, ' ').trim();
-  return text ? text.slice(0, 100) + (text.length > 100 ? '…' : '') : english ? 'Activity record' : '活动记录';
+  return summary ? `${english ? 'Recorded: ' : '本段记录：'}${summary}` : english ? 'Activity record' : '本段活动记录';
 }
 
 export function buildActivityCard(events: readonly ActivityEvent[], retired: boolean, english = false,
@@ -206,7 +206,9 @@ export function buildActivityCard(events: readonly ActivityEvent[], retired: boo
   // Split on code-point boundaries BEFORE escaping. Budget the doubly encoded
   // wire text so CJK, entities, quotes and newlines cannot exceed 30 KB.
   const raw = (items.filter(item => item.text).map(item => item.text).join('\n\n')
-    || (english ? 'Waiting for activity updates.' : '等待活动更新。'))
+    || (retired
+      ? (english ? 'No activity details were recorded.' : '本段无可展示的活动内容。')
+      : (english ? 'Waiting for activity updates.' : '等待活动更新。')))
     .replace(/\t/g, '\u00a0'.repeat(4)).replace(/ {2,}/g, spaces => '\u00a0'.repeat(spaces.length));
   const pages: string[] = [];
   let chunk = '', bytes = 0;

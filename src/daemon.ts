@@ -27591,6 +27591,25 @@ function currentDocSubscriptionForDelivery(
   return current;
 }
 
+/** Refresh the dashboard activity clock after document-comment admission.
+ *
+ * At this point the worker already owns the turn. Activity persistence is a
+ * presentation side effect: if it fails, the provider must still observe a
+ * successful delivery or it will retry an already-executing comment after the
+ * cleanup path has removed its reply target. */
+function markDocCommentActivityAfterAdmission(ds: DaemonSession, turnId: string): void {
+  try {
+    // Comment events do not prove a Lark sender_type, so do not advance the
+    // stricter human-only clock used by schedule --follow-active.
+    markSessionActivity(ds);
+  } catch (err) {
+    logger.error(
+      `[${tag(ds)}] doc-comment activity projection failed after admission `
+      + `(turn ${turnId.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 async function runClaimedDocCommentTurn(
   claimKey: string,
   work: () => Promise<void>,
@@ -27859,6 +27878,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
           throw new Error('worker became unavailable during comment:live-send');
         }
         acceptDocCommentSession(ds);
+        markDocCommentActivityAfterAdmission(ds, turnId);
         try {
           beginNewTurn(ds, text, turnId);
         } catch (err) {
@@ -27934,6 +27954,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         }
         acceptDocCommentSession(ds);
       }
+      markDocCommentActivityAfterAdmission(ds, turnId);
     }, cleanupFailedDelivery);
   } catch (err) {
     if (err instanceof DocCommentSubscriptionChangedError) {

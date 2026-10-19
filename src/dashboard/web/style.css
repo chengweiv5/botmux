@@ -3079,12 +3079,15 @@ button.primary {
 
 .sessions-scroll-host-contents { display: contents; }
 .sessions-table-scroll-host { position: relative; min-width: 0; min-height: 0; }
-.sessions-table-scroll-host > .sessions-view-stage { height: 100%; }
+/* Keep the interactive hit strip outside the scrolling content: even a partly
+   clipped row checkbox at the viewport edge must retain native hit testing. */
+.sessions-table-scroll-host > .sessions-view-stage { height: calc(100% - 6px); }
 @media (max-width: 720px) {
   .sessions-table-scroll-host > .sessions-view-stage { height: auto; }
 }
 .session-horizontal-scrollbar {
   position: absolute;
+  bottom: 0;
   height: 6px;
   z-index: 1;
   opacity: 0;

@@ -1,7 +1,7 @@
 import { useEffect, useRef, type RefObject } from 'react';
 
-/** Table-only sibling overlay. It lives in the table viewport's stacking context, not
- * the body portal: popups/modal layers keep their ordinary native hit testing. */
+/** Table-only sibling in a reserved bottom hit strip, outside scrollable content.
+ * Shared stacking with the table preserves native popup/modal hit testing. */
 export function SessionHorizontalScrollbar({ scrollRef }: { scrollRef: RefObject<HTMLDivElement | null> }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
@@ -36,7 +36,6 @@ export function SessionHorizontalScrollbar({ scrollRef }: { scrollRef: RefObject
       // A sibling is excluded from target.scrollWidth/Height. No scroll-offset
       // compensation: content shrink is clamped by the browser in one step.
       track.style.left = `${target.offsetLeft + target.clientLeft + 3}px`;
-      track.style.top = `${target.offsetTop + target.clientTop + target.clientHeight - 9}px`;
       track.style.width = `${length}px`;
       thumb.style.width = `${size}px`;
       thumb.style.transform = `translateX(${(length - size) * target.scrollLeft / range}px)`;

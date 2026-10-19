@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { build } from 'esbuild';
 import { chromium, type Browser, type Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -9,6 +11,7 @@ describe('session table local horizontal overlay (C)', () => {
   let script: string;
   let measuredScript: string;
   let realScript: string;
+  const screenshotDir = mkdtempSync(join(tmpdir(), 'botmux-session-scrollbar-'));
   const css = readFileSync('src/dashboard/web/style.css', 'utf8');
   beforeAll(async () => {
     const result = await build({
@@ -21,7 +24,7 @@ describe('session table local horizontal overlay (C)', () => {
         function Fixture(){const ref=useRef(null);const [table,setTable]=useState(true);window.setTableView=setTable;return <>
           <div className="sessions-table-scroll-host" style={{position:'absolute',left:80,top:80,width:400,height:240}}>
           <div ref={ref} id="scroller" className="sessions-view-stage" data-view={table?'table':'topics'} data-local-horizontal-scrollbar={table?'':undefined}
-            style={{width:'100%',height:'100%',overflow:'auto'}}>
+            style={{width:'100%',height:'calc(100% - 6px)',overflow:'auto'}}>
             <table id="sessions-table" style={{minWidth:1600,height:960}}><tbody><tr><td>Session control table</td></tr></tbody></table>
           </div>
           {table?<SessionHorizontalScrollbar scrollRef={ref}/>:null}
@@ -181,7 +184,7 @@ describe('session table local horizontal overlay (C)', () => {
     await page.locator('#scroller').evaluate(el => el.scrollTo({ left: 300, top: 250, behavior: 'instant' }));
     await page.waitForTimeout(100);
     const box = await track().boundingBox(); if (!box) throw Error('missing track');
-    expect(box.x).toBe(83); expect(box.y).toBe(311);
+    expect(box.x).toBe(83); expect(box.y).toBe(314);
     expect(await page.locator('#scroller').evaluate(el => [el.clientWidth, el.clientHeight])).toEqual(size);
     expect(await page.locator('#scroller').evaluate(el => el.scrollHeight)).toBe(960);
     const p = await begin(); await page.mouse.move(p.x + 30, p.y); await page.mouse.up();
@@ -318,7 +321,7 @@ describe('session table local horizontal overlay (C)', () => {
     await page.waitForTimeout(250); await page.mouse.move(200, 150);
     const p = await begin(); await page.mouse.move(p.x + 30, p.y); await page.mouse.up(); expect(await left()).toBeGreaterThan(0);
     expect(await page.locator('#cyber-fx').evaluate(el => el.getAnimations({ subtree: true }).length)).toBeGreaterThan(0);
-    await page.screenshot({ path: 'logs/floating-scrollbar-drag/local-c-cyber.png' });
+    await page.screenshot({ path: join(screenshotDir, 'local-c-cyber.png') });
   });
 
   for (const cancel of ['inert', 'blur', 'pointercancel', 'unmount', 'overflow'] as const) {
@@ -359,7 +362,7 @@ describe('session table local horizontal overlay (C)', () => {
     expect(await page.evaluate(() => (window as any).bodyScans)).toBe(0);
     await page.evaluate(() => clearInterval((window as any).ticker));
     await page.mouse.move(p.x + 30, p.y);
-    await page.screenshot({ path: 'logs/floating-scrollbar-drag/local-c-default.png' });
+    await page.screenshot({ path: join(screenshotDir, 'local-c-default.png') });
   });
 
   it('keeps local geometry work bounded with 15k nodes and the real table page layout', async () => {
@@ -494,7 +497,16 @@ describe('session table local horizontal overlay (C)', () => {
         const geometry = await page.evaluate(() => {
           const b = document.querySelector('.session-horizontal-scrollbar')!.getBoundingClientRect();
           const d = document.querySelector('.session-table-columns-dropdown')!.getBoundingClientRect();
-          return { x: d.left + 25, y: b.top + 3, menuTop: d.top, menuBottom: d.bottom, barLeft: b.left, barRight: b.right };
+          // Find an actual visible checkbox instead of assuming the old bar
+          // center still intersects an INPUT after reserving its bottom strip.
+          const inputs = [...document.querySelectorAll<HTMLInputElement>('.session-table-columns-item input')];
+          const stageBottom = document.querySelector('.sessions-view-stage')!.getBoundingClientRect().bottom;
+          const visible = inputs.map(input => input.getBoundingClientRect())
+            .filter(r => r.top >= d.top && r.bottom <= Math.min(d.bottom, stageBottom));
+          const r = visible.at(-1);
+          if (!r) throw Error('missing visible column checkbox');
+          return { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2,
+            menuTop: d.top, menuBottom: d.bottom, barLeft: b.left, barRight: b.right };
         });
         expect(geometry.y).toBeGreaterThan(geometry.menuTop);
         expect(geometry.y).toBeLessThan(geometry.menuBottom);
@@ -513,7 +525,7 @@ describe('session table local horizontal overlay (C)', () => {
         await expect.poll(() => page.locator('#sessions-table thead th').count()).toBe(columnsBefore + (initial ? -1 : 1));
         expect(await stage.evaluate(el => el.scrollLeft)).toBeLessThanOrEqual(beforeLeft);
         expect(await page.locator('.session-horizontal-scrollbar.is-dragging').count()).toBe(0);
-        await page.screenshot({ path: `logs/floating-scrollbar-drag/c02-${from}-${reduced ? 'reduced' : 'motion'}.png` });
+        await page.screenshot({ path: join(screenshotDir, `c02-${from}-${reduced ? 'reduced' : 'motion'}.png`) });
         await page.locator('.session-table-columns-menu summary').click();
         await stage.evaluate(el => el.scrollTo({ left: 0, top: 0, behavior: 'instant' }));
         await page.mouse.move(200, 300); const p = await begin();
@@ -525,4 +537,82 @@ describe('session table local horizontal overlay (C)', () => {
       });
     }
   }
+
+  it('keeps real row checkboxes clickable at every bottom-edge scroll position, including clipped remnants', async () => {
+    await page.close(); page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
+    await page.route('**/*', route => {
+      const entry = new URL(route.request().url()).pathname === '/';
+      return route.fulfill({ contentType: entry ? 'text/html' : 'application/json', body: entry
+        ? '<div id="app-root"><main id="page-host" style="width:900px;height:600px;margin:30px 50px;padding:0"></main></div>'
+        : JSON.stringify({ ok: true, bots: [], groups: [], chats: [{ chatId: 'oc_test', name: 'Test chat' }] }) });
+    });
+    await page.goto('http://row-control-regression.invalid/');
+    await page.evaluate(() => localStorage.setItem('botmux.dashboard.sessions.view', 'table'));
+    await page.addStyleTag({ content: css }); await page.addScriptTag({ content: realScript });
+    await page.waitForFunction(() => document.querySelectorAll('#sessions-table tbody tr').length === 40);
+    await page.mouse.move(200, 300);
+    const stage = page.locator('.sessions-view-stage');
+    const input = page.locator('#sessions-table tbody input[type="checkbox"]').nth(10);
+    // Sweep the former 6px hit strip and a half-clipped checkbox. Real mouse
+    // clicks, not input.click() or forcing the table back to the origin.
+    for (const distance of [12, 8, 6, 4, 2, 0, -2, -4]) {
+      await input.evaluate((el, distance) => {
+        const scroller = el.closest('.sessions-view-stage')!;
+        const bottom = scroller.getBoundingClientRect().bottom;
+        const r = el.getBoundingClientRect();
+        scroller.scrollBy({ top: (r.top + r.bottom) / 2 - (bottom - distance), behavior: 'instant' });
+      }, distance);
+      await page.waitForTimeout(40);
+      const point = await input.evaluate(el => {
+        const s = el.closest('.sessions-view-stage')!; const bounds = s.getBoundingClientRect();
+        const r = el.getBoundingClientRect();
+        const top = Math.max(r.top, bounds.top); const bottom = Math.min(r.bottom, bounds.bottom);
+        return { x: (r.left + r.right) / 2, y: (top + bottom) / 2, visible: bottom - top };
+      });
+      expect(point.visible).toBeGreaterThan(0);
+      expect(await page.evaluate(p => document.elementFromPoint(p.x, p.y)?.tagName, point)).toBe('INPUT');
+      const initial = await input.isChecked(); const beforeLeft = await stage.evaluate(el => el.scrollLeft);
+      await input.evaluate(el => el.addEventListener('click', event => { (window as any).rowTrusted = event.isTrusted; }, { once: true }));
+      await page.mouse.click(point.x, point.y);
+      await expect.poll(() => input.isChecked()).toBe(!initial);
+      expect(await page.evaluate(() => (window as any).rowTrusted)).toBe(true);
+      expect(await stage.evaluate(el => el.scrollLeft)).toBe(beforeLeft);
+      expect(await page.locator('.session-horizontal-scrollbar.is-dragging').count()).toBe(0);
+      const covered = await stage.evaluate(el => {
+        const s = el.getBoundingClientRect(); let count = 0;
+        for (const input of el.querySelectorAll('tbody input[type="checkbox"]')) {
+          const r = input.getBoundingClientRect();
+          for (let y = Math.max(r.top + .5, s.top + .5); y < Math.min(r.bottom, s.bottom); y += 2) {
+            if (document.elementFromPoint((r.left + r.right) / 2, y)?.closest('.session-horizontal-scrollbar')) count++;
+          }
+        }
+        return count;
+      });
+      expect(covered).toBe(0);
+    }
+    const geometry = await stage.evaluate(el => ({ bottom: el.getBoundingClientRect().bottom,
+      hostBottom: el.parentElement!.getBoundingClientRect().bottom }));
+    const bar = await track().boundingBox(); if (!bar) throw Error('missing track');
+    expect(bar.y).toBeCloseTo(geometry.bottom, 4);
+    expect(bar.y + bar.height).toBeCloseTo(geometry.hostBottom, 4);
+    await page.screenshot({ path: join(screenshotDir, 'row-checkbox-bottom-edge.png') });
+  });
+
+  it('stops a captured drag when a native modal opens and recovers after it closes', async () => {
+    const p = await begin();
+    await page.evaluate(() => {
+      const dialog = document.createElement('dialog'); dialog.id = 'during-modal';
+      dialog.innerHTML = '<button>Modal action</button>'; document.body.appendChild(dialog); dialog.showModal();
+    });
+    await page.mouse.move(p.x + 50, p.y); await page.mouse.up();
+    expect(await left()).toBe(0);
+    expect(await track().getAttribute('class')).not.toContain('is-dragging');
+    const button = page.locator('#during-modal button');
+    await button.evaluate(el => el.addEventListener('click', e => { (window as any).modalTrusted = e.isTrusted; }));
+    await button.click(); expect(await page.evaluate(() => (window as any).modalTrusted)).toBe(true);
+    await page.locator('#during-modal').evaluate(el => { (el as HTMLDialogElement).close(); el.remove(); });
+    await page.mouse.move(200, 150); const again = await begin();
+    await page.mouse.move(again.x + 30, again.y); await page.mouse.up();
+    expect(await left()).toBeGreaterThan(0);
+  });
 });

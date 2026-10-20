@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { build } from 'esbuild';
@@ -71,7 +71,10 @@ describe('session table local horizontal overlay (C)', () => {
     measuredScript = measured.outputFiles[0].text;
     browser = await chromium.launch();
   });
-  afterAll(async () => { await browser?.close(); });
+  afterAll(async () => {
+    await browser?.close();
+    rmSync(screenshotDir, { recursive: true, force: true });
+  });
   beforeEach(async () => {
     page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
     page.setDefaultTimeout(5000);
@@ -201,6 +204,42 @@ describe('session table local horizontal overlay (C)', () => {
     await page.waitForTimeout(100);
     expect(await left()).toBe(200);
     expect(await page.locator('#scroller').evaluate(el => el.scrollTop)).toBe(240);
+  });
+
+  it('keeps wheel over scrolling content on the native scroll chain (no preventDefault)', async () => {
+    // The host listener must only forward wheel events that land on the bar or
+    // the reserved gutter; events over the table content keep browser-native
+    // scrolling (platform line deltas, pinch zoom, scroll chaining).
+    await page.evaluate(() => {
+      (window as any).__contentDefaultPrevented = null;
+      window.addEventListener('wheel', event => {
+        if ((event.target as HTMLElement).closest?.('#scroller')) {
+          (window as any).__contentDefaultPrevented = event.defaultPrevented;
+        }
+      }, { once: true });
+    });
+    await page.mouse.move(200, 200);
+    await page.mouse.wheel(0, 120);
+    await page.waitForTimeout(120);
+    expect(await page.evaluate(() => (window as any).__contentDefaultPrevented)).toBe(false);
+  });
+
+  it('forwards vertical wheel from the reserved gutter while the bar is hidden without horizontal overflow', async () => {
+    // Columns fit the viewport: the interactive bar hides, but the reserved
+    // 6px gutter (the bar's parent area) must still scroll the table vertically.
+    await page.locator('#sessions-table').evaluate(el => { el.style.minWidth = '100px'; });
+    await page.waitForTimeout(100);
+    expect(await track().evaluate(el => (el as HTMLElement).hidden)).toBe(true);
+    const point = await page.locator('#scroller').evaluate(el => {
+      const host = el.parentElement!;
+      const h = host.getBoundingClientRect(), s = el.getBoundingClientRect();
+      return { x: h.left + h.width / 2, y: (s.bottom + h.bottom) / 2 };
+    });
+    await page.locator('#scroller').evaluate(el => el.scrollTo({ top: 0, behavior: 'instant' }));
+    await page.mouse.move(point.x, point.y);
+    await page.mouse.wheel(0, 120);
+    await page.waitForTimeout(150);
+    expect(await page.locator('#scroller').evaluate(el => el.scrollTop)).toBe(120);
   });
 
   it('does not request a global rescan for local hover/thumb style writes', async () => {

@@ -91,10 +91,14 @@ export function SessionHorizontalScrollbar({ scrollRef }: { scrollRef: RefObject
     target.addEventListener('scroll', scroll);
     host.addEventListener('pointerenter', enter);
     host.addEventListener('pointerleave', leave);
-    // Wheel now lands on a sibling, not a descendant of the controlled scroller.
-    // Forward its deltas locally; do not add a document-level wheel handler.
+    // Wheel over the scrolling content is left to the browser (the scroller is
+    // in the event's scroll chain), so do not intercept it there. On the bar and
+    // the reserved bottom gutter — siblings of the scroller, including when the
+    // bar is hidden because the columns fit — the scroller is out of the chain:
+    // listen on the host and forward those deltas locally.
     const wheel = (event: WheelEvent) => {
       if (event.ctrlKey) return;
+      if (target.contains(event.target as Node)) return;
       const unit = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
       let left = event.deltaX * (event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? target.clientWidth : unit);
       let top = event.deltaY * (event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? target.clientHeight : unit);
@@ -102,7 +106,7 @@ export function SessionHorizontalScrollbar({ scrollRef }: { scrollRef: RefObject
       target.scrollBy({ left, top, behavior: 'instant' });
       event.preventDefault();
     };
-    track.addEventListener('wheel', wheel, { passive: false });
+    host.addEventListener('wheel', wheel, { passive: false });
     track.addEventListener('pointerdown', down);
     track.addEventListener('pointermove', move);
     track.addEventListener('pointerup', up);
@@ -119,7 +123,7 @@ export function SessionHorizontalScrollbar({ scrollRef }: { scrollRef: RefObject
       target.removeEventListener('scroll', scroll);
       host.removeEventListener('pointerenter', enter);
       host.removeEventListener('pointerleave', leave);
-      track.removeEventListener('wheel', wheel);
+      host.removeEventListener('wheel', wheel);
       track.removeEventListener('pointerdown', down);
       track.removeEventListener('pointermove', move);
       track.removeEventListener('pointerup', up);

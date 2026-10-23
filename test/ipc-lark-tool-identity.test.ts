@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -17,6 +17,7 @@ import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
 import { registerDocCommentTurn, clearDocCommentTurnProvenance } from '../src/core/doc-comment-turn-provenance.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
@@ -29,6 +30,11 @@ beforeEach(async () => {
     larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { killed: false },
     managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', originChannelId: 'ab'.repeat(32), callerOpenId: 'ou_sender' },
   };
+  session.worker.pid = process.pid;
+  session.workerGeneration = session.session.workerGeneration = 1;
+  session.localProcessAttestation = { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid),
+    workerGeneration: 1, backendType: 'pty', credentialIsolated: false };
+  session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
   botToken.mockReset().mockResolvedValue('bound-bot-token');
@@ -70,10 +76,12 @@ describe('session application identity route', () => {
     (session.session.docCommentTargets ??= {})[turnId] = target;
     registerDocCommentTurn(session, { ...target, workerGeneration: 1, authorOpenId: author });
     session.managedTurnOrigin = { turnId, capability: 'comment_cap', originChannelId: 'ab'.repeat(32), callerOpenId: author };
+    session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
     return target;
   }
   it('rejects a previous turn background process holding only the persistent binding key before token/OAuth providers', async () => {
     commentTurn('reply_new', 'ou_newauthor');
+    session.localProcessAttestation = undefined;
     vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_newauthor', type: 'user' });
     const authProvider = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/fixture',
       scopes: ['im:chat:read'], expiresIn: 600, poll: vi.fn() } as any);
@@ -104,6 +112,42 @@ describe('session application identity route', () => {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ mode: 'user' }),
       });
       expect(response.status).toBe(200);
+    } finally { child.kill('SIGKILL'); }
+  });
+  it.skipIf(process.platform !== 'linux')('rejects an old background process running real wrappers that re-read the new author tuple', async () => {
+    commentTurn('70021', 'ou_B');
+    session.managedTurnOrigin.capability = 'aa'.repeat(32);
+    const relay = join(dir, 'stable-relay'); mkdirSync(relay);
+    seedPersistedSessionRows(dir, 'cli_bound', { 'tool-session': { ...session.session, sessionId: 'tool-session',
+      larkAppId: 'cli_bound', chatId: 'oc_chat', rootMessageId: 'om_root', title: 'fixture', createdAt: new Date().toISOString() } });
+    writeFileSync(join(dir, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_bound', larkAppSecret: 'fixture', cliId: 'codex' }]));
+    const real = join(dir, 'fake-lark');
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write("must-not-run");', { mode: 0o755 });
+    binding.realBinary = real; binding.ipcPort = ipc!.port;
+    writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_B', type: 'user' });
+    const oauth = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/mock', scopes: ['im:chat:read'], expiresIn: 300, poll: vi.fn() } as any);
+    commentTurn('70020', 'ou_A');
+    const child = spawnTsScript(join(process.cwd(), 'test/fixtures/lark-stale-wrapper-client.ts'), [], {
+      env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once('message', () => resolve()); child.once('error', reject); });
+      // A's child already exists when B's comment becomes current.
+      commentTurn('70021', 'ou_B');
+      session.managedTurnOrigin.capability = 'aa'.repeat(32);
+      session.managedTurnOrigin.preexistingProcessIdentities.push(`${child.pid}:${readProcessStartIdentity(child.pid!)}`);
+      writeFileSync(join(relay, '.botmux-origin-capability.json'), JSON.stringify({ sessionId: 'tool-session', larkAppId: 'cli_bound',
+        turnId: '70021', capability: session.managedTurnOrigin.capability, channelId: session.managedTurnOrigin.originChannelId }), { mode: 0o600 });
+      const result = new Promise<any>(resolve => child.once('message', resolve));
+      child.send({ repo: process.cwd(), bindingPath: larkToolBindingPath(dir, 'tool-session'), relayDir: relay, port: ipc!.port });
+      const output = await result;
+      expect(output.user.code, output.user.err).toBe(77);
+      expect(output.user.err).toContain('current_actor_unverified');
+      expect(output.auth.code, output.auth.err).not.toBe(0);
+      expect(output.auth.out, output.auth.err).toContain('current_actor_unverified');
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+      expect(oauth).not.toHaveBeenCalled();
     } finally { child.kill('SIGKILL'); }
   });
   it.each(['capability', 'turn', 'channel'])('rejects a stale isolated %s before providers', async mismatch => {
@@ -290,6 +334,7 @@ describe('session application identity route', () => {
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
     session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', originChannelId: 'ab'.repeat(32), callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
@@ -348,13 +393,13 @@ describe('session application identity route', () => {
     expect(await (await request('bot')).json()).toMatchObject({ credential: 'refreshed-token' });
     expect(post).toHaveBeenCalledTimes(2);
   });
-  it('uses a current channel tuple on macOS without Linux process attestation', async () => {
+  it('fails closed on macOS where a channel tuple cannot prove a fresh requester process', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
     const response = await request('user');
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'user', credential: 'bound-user-token' });
+    expect(response.status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
-  it('authorizes the same app on macOS through the installed session entry', async () => {
+  it('does not issue OAuth on macOS from a stable session entry without process proof', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
     vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender' } as any);
     const poll = vi.fn(async () => ({ status: 'ready' as const, token: 'authorized-token' }));
@@ -364,12 +409,10 @@ describe('session application identity route', () => {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ ...body, ...originTuple() }),
     });
     const response = await post('auth-request', { scopes: ['sheets:spreadsheet:read'] });
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(403);
     const request = await response.json() as { requestId: string };
-    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu',
-      ['sheets:spreadsheet:read'], 'ou_sender', expect.any(Function));
-    const ready = await post('auth-status', { requestId: request.requestId });
-    expect(await ready.json()).toEqual({ ok: true, status: 'ready' });
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
+    expect((await post('auth-status', { requestId: request.requestId })).status).toBe(403);
   });
   it('requires the current user’s grant and never uses the machine account', async () => {
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);

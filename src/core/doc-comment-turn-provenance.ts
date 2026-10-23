@@ -20,7 +20,22 @@ interface CommentTurnRecord {
 // payload, subscription owner, display cache, or document reply destination.
 const records = new WeakMap<DaemonSession, Map<string, CommentTurnRecord>>();
 const cliLifetimes = new WeakMap<DaemonSession, number>();
-const vetoes = new Set<string>();
+/** Never evict a negative while a pending retry can still name it. Once full,
+ * withhold all comment-human grants until daemon restart rather than resurrect
+ * an evicted reply. Memory stays bounded even for unbounded edit traffic. */
+export class DocCommentVetoLedger {
+  private readonly entries = new Set<string>();
+  private saturated = false;
+  constructor(private readonly capacity = 5_000) {}
+  add(key: string): void {
+    if (this.entries.has(key) || this.saturated) return;
+    if (this.entries.size >= this.capacity) { this.saturated = true; return; }
+    this.entries.add(key);
+  }
+  has(key: string): boolean { return this.saturated || this.entries.has(key); }
+  get size(): number { return this.entries.size; }
+}
+const vetoes = new DocCommentVetoLedger();
 const commentKey = (app: string, file: string, comment: string, reply: string) => JSON.stringify([app, file, comment, reply]);
 
 export function docCommentCliLifetime(ds: DaemonSession): number {

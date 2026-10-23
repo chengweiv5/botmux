@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -11,6 +12,7 @@ import { restartInterruptionNote, restartInterruptionNotice } from '../src/servi
 import { registerDocCommentTurn, currentDocCommentHuman, revokeDocCommentCliLifetime,
   resolveDocCommentTurnCaller } from '../src/core/doc-comment-turn-provenance.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { writeSessionIdentity, sessionIdentityPath, renderIdentityWrapper } from '../src/core/cli-identity.js';
 
 // The real worker resumes a fake Pi whose previous process died mid-turn (the
 // 10-21 tmux server loss): the resumed CLI must receive the restart note and
@@ -142,6 +144,40 @@ async function crashAndRestart(env: ReturnType<typeof setup>, w: ReturnType<type
 }
 
 describe('worker restart interruption notice (real worker, fake Pi)', () => {
+  it('parent-exit journal and successor restore never carry comment personal credentials', async () => {
+    const env = setup('comment-parent-journal', { recordTurns: false });
+    writeFileSync(env.busyFlag, '1');
+    const first = startWorker(env, { resume: true });
+    await waitUntil(() => env.processInput(0) !== undefined, first.logs);
+    const item = { type: 'message' as const, content: 'queued comment body', turnId: '70091',
+      trustedCaller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_author', senderType: 'user' as const } };
+    writeSessionIdentity(env.dataDir, env.sid, { tool: 'bytedcli', cloudJwt: 'fixture-old-credential', turnId: '70091' });
+    child!.send(item);
+    await new Promise(done => setTimeout(done, 500));
+    const exited = new Promise<void>(done => child!.once('exit', () => done()));
+    child!.kill('SIGTERM'); await exited;
+    const saved = JSON.parse(readFileSync(env.unsentJournal, 'utf8'));
+    expect(saved.inputs).toEqual([expect.objectContaining({ content: item.content, turnId: '70091' })]);
+    expect(saved.inputs[0].trustedCaller).toBeUndefined();
+    expect(saved.inputs[0].turnCallerOpenId).toBeUndefined();
+    expect(existsSync(sessionIdentityPath(env.dataDir, env.sid, 'bytedcli'))).toBe(false);
+    // A pre-upgrade journal and credential are explicitly planted: restore is
+    // a second independent boundary, not reliant on the predecessor fix.
+    saved.inputs[0].trustedCaller = item.trustedCaller;
+    saved.inputs[0].turnCallerOpenId = 'ou_author';
+    writeFileSync(env.unsentJournal, JSON.stringify(saved));
+    writeSessionIdentity(env.dataDir, env.sid, { tool: 'bytedcli', cloudJwt: 'fixture-old-credential', turnId: '70091' });
+    rmSync(env.busyFlag, { force: true });
+    const second = startWorker(env, { resume: true });
+    await waitUntil(() => !!env.processInput(1)?.includes(item.content), second.logs);
+    expect(existsSync(sessionIdentityPath(env.dataDir, env.sid, 'bytedcli'))).toBe(false);
+    expect(readFileSync(join(env.dataDir, 'cli-identity', `${env.sid}.bin`, '.data', 'turn'), 'utf8').split('\n')[1]).not.toBe('ou_author');
+    const wrapper = join(root!, 'byted-wrapper'); writeFileSync(wrapper, renderIdentityWrapper('bytedcli', '/usr/bin/printenv'), { mode: 0o755 });
+    const response = spawnSync('/bin/sh', [wrapper, '--version'], { env: { PATH: '/usr/bin:/bin',
+      SESSION_DATA_DIR: env.dataDir, BOTMUX_SESSION_ID: env.sid }, encoding: 'utf8', timeout: 5000 });
+    expect(response.status).not.toBe(0);
+    expect(response.stdout).not.toContain('fixture-old-credential');
+  }, 60_000);
   it.each([false, true])('keeps real crash carryOver replay anonymous until a fresh comment admission (nativeStart=%s)', async nativeStart => {
     const env = setup(`comment-crash-lifetime-${nativeStart}`, { recordTurns: nativeStart });
     const w = startWorker(env);

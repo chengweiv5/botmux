@@ -24,7 +24,7 @@ import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync,
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
-import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, clearAllSessionIdentities, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -7050,6 +7050,12 @@ function unsentInputJournalPath(): string | undefined {
 function saveUnsentInputsForSuccessor(reason: string): void {
   const path = unsentInputJournalPath();
   if (!path || lastInitConfig?.adoptMode || isCodexAppCliId(lastInitConfig?.cliId)) return;
+  for (const item of pendingMessages) {
+    if (item.turnId && /^\d+$/.test(item.turnId)) {
+      scrubReplayedCommentCaller(item);
+      clearAllSessionIdentities(process.env.SESSION_DATA_DIR!, sessionId);
+    }
+  }
   try {
     const saved = saveUnsentInputs(path, pendingMessages);
     // Restored inputs not written yet are in that save; the rest are written.
@@ -7078,6 +7084,9 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
   if (!path || cfg.adoptMode || isCodexAppCliId(cfg.cliId)) return [];
   try {
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
+    if ([...inputs, ...expired, ...unconfirmed].some(item => item.turnId && /^\d+$/.test(item.turnId))) {
+      clearAllSessionIdentities(process.env.SESSION_DATA_DIR!, sessionId);
+    }
     for (const input of inputs) restoredUnsentInputs.add(input);
     if (inputs.length > 0) log(`Re-queued ${inputs.length} input(s) the previous worker never wrote to the CLI`);
     if (unconfirmed.length > 0) {
@@ -27200,6 +27209,9 @@ process.on('message', async (raw: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
+      // Clear predecessor comment credentials before a new CLI can spawn a
+      // tool, not after spawnCli has already exposed its inherited files.
+      const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg);
       // Dashboard grants stay per-boot, while the Lark-card capability is
       // revocable at the logical Session lifecycle boundary.
       refreshTerminalWriteToken();
@@ -27442,7 +27454,6 @@ process.on('message', async (raw: unknown) => {
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         // Received before this init's own prompt, so they go ahead of it.
-        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg);
         let initialInputCommitted = false;
         let initialInputQueued = false;
         if (shouldQueueInitialPrompt({

@@ -3093,8 +3093,10 @@ function currentUserRequestProof(
       || body.originDispatchAttempt !== origin.dispatchAttempt
       || (origin.originChannelId ? body.originChannelId !== origin.originChannelId
         : boundTool || body.originChannelId !== undefined)) return;
-    return stillCurrent;
   }
+  // The channel file is readable by old descendants too. A matching bearer
+  // selects the turn; only a fresh process in that turn may use personal auth.
+  // Platforms without kernel-backed lineage fail closed (including macOS).
   const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort, localPort: req.socket.localPort });
   if (!peer.ok) return;

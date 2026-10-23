@@ -26,6 +26,9 @@ beforeEach(async () => {
     worker: { killed: false }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
   };
+  session.worker.pid = process.pid;
+  session.localProcessAttestation = { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid), workerGeneration: 4 };
+  session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'auth-session' ? session : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 });
@@ -291,8 +294,9 @@ describe('agent authorization', () => {
     const response = await post('auth-status', { requestId });
     // Still refused: the live turn file does not line up, so refresh fails
     // closed and the fresh token is never published to a queued identity.
-    expect(response.status).toBe(409);
-    expect(await response.json()).toEqual({ ok: false, error: 'auth_turn_changed' });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
   });
 
   it('daemon-side polling completes the grant after the Agent turn ends without a wait call', async () => {
@@ -306,6 +310,7 @@ describe('agent authorization', () => {
     expect(cliIdentity.refreshSessionIdentity).not.toHaveBeenCalled();
     // The same human's follow-up turn claims the already-completed grant.
     session.managedTurnOrigin = { capability: CAP, turnId: 'om_next', callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
     const response = await post('auth-status', { requestId, originTurnId: 'om_next' });
     expect(await response.json()).toEqual({ ok: true, status: 'ready' });
     expect(cliIdentity.refreshSessionIdentity).toHaveBeenCalledWith(expect.any(String), 'auth-session', {

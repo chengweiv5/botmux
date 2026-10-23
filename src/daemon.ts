@@ -28585,6 +28585,15 @@ async function autoCreateDocSession(
  * success and advancing the poll cursor past a later failure.
  */
 const handledDocCommentTurns = new BoundedMap<string, Promise<boolean>>(5_000);
+const docCommentAdmissionEvidence = new Map<string, { ws?: DocCommentContext }>();
+function docCommentClaimKey(ctx: DocCommentContext): string {
+  return `${ctx.larkAppId}:${ctx.sub.fileToken}:${ctx.replyId || ctx.commentId}`;
+}
+function mergeDocCommentWsEvidence(ctx: DocCommentContext): void {
+  if (ctx.entrySource !== 'ws' || !ctx.operatorOpenId || ctx.operatorOpenId !== ctx.authorOpenId) return;
+  const pending = docCommentAdmissionEvidence.get(docCommentClaimKey(ctx));
+  if (pending) pending.ws = { ...ctx };
+}
 
 /**
  * Thrown by a doc-comment turn that must be DEFERRED (not delivered) because the
@@ -28688,6 +28697,7 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   // BEFORE bot admission and delivery claim joins: a follower's explicit edit
   // veto must revoke the winner too, even while its reply read is in flight.
   applyDocCommentIdentityVeto(ctx);
+  mergeDocCommentWsEvidence(ctx);
   return withBotTurnAdmission(
     ctx.larkAppId,
     () => handleDocCommentAdmitted(ctx),
@@ -28709,10 +28719,15 @@ function applyDocCommentIdentityVeto(ctx: DocCommentContext): void {
 
 async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0): Promise<boolean> {
   applyDocCommentIdentityVeto(ctx);
+  mergeDocCommentWsEvidence(ctx);
   const { larkAppId, commentId, text } = ctx;
   let sub = ctx.sub;
   const turnId = ctx.replyId || commentId;
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
+  // Only in-flight owners hold positive testimony; completed claim duplicates
+  // never upgrade old authority. Do not evict live records on capacity pressure.
+  const ownsEvidence = !handledDocCommentTurns.has(claimKey) && docCommentAdmissionEvidence.size < 5_000;
+  if (ownsEvidence) docCommentAdmissionEvidence.set(claimKey, { ws: ctx.entrySource === 'ws' ? { ...ctx } : undefined });
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
   let reactionType: string | undefined;
@@ -28910,14 +28925,21 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
           const reply = comment?.commentId === commentId
             ? comment.replies.find(r => r.replyId === userReplyId) : undefined;
           const author = reply?.userId;
-          if (ctx.entrySource === 'ws' && ctx.operatorOpenId === author && author && /^ou_[A-Za-z0-9]+$/.test(author)
+          if (author && /^ou_[A-Za-z0-9]+$/.test(author)
             && (!ctx.authorOpenId || ctx.authorOpenId === author)
             && (!ctx.operatorOpenId || ctx.operatorOpenId === author)
             && reply!.text.replaceAll(BOT_REPLY_SENTINEL, '').trim() === text.trim()
             && author !== getBot(larkAppId).botOpenId
             && !isBotAuthoredReply(userReplyId) && !hasBotSentinel(reply!.text)) {
             const verified = await resolveVerifiedUserIdentity(larkAppId, author);
-            if (verified?.type === 'user' && verified.openId === author) humanAuthor = author;
+            // Read merged WS evidence AFTER the human lookup too: a normal WS
+            // follower arriving during either network await must not lose its
+            // author testimony to the poll owner's earlier empty snapshot.
+            const testimony = docCommentAdmissionEvidence.get(claimKey)?.ws;
+            if (verified?.type === 'user' && verified.openId === author
+              && testimony?.operatorOpenId === author && testimony.authorOpenId === author
+              && testimony.commentId === commentId && testimony.replyId === userReplyId
+              && testimony.sub.fileType === sub.fileType && testimony.text.trim() === text.trim()) humanAuthor = author;
           }
         } catch { /* Missing positive testimony withholds personal authority. */ }
       }
@@ -29081,6 +29103,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
     logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
     return false;
   } finally {
+    if (ownsEvidence) docCommentAdmissionEvidence.delete(claimKey);
     releaseDeliveryReservation?.();
   }
 }

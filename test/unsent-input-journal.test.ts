@@ -14,6 +14,15 @@ const dir = mkdtempSync(join(tmpdir(), 'unsent-input-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('unsent input journal', () => {
+  it('saves comment content without predecessor human authority and sanitizes legacy restores', () => {
+    const path = join(dir, 'comment.unsent.json');
+    const item = { content: 'comment body', turnId: '70001', turnCallerOpenId: 'ou_author', trustedCaller: { requestUserOpenId: 'ou_author', senderType: 'user' as const } };
+    saveUnsentInputs(path, [item], 1000);
+    expect(JSON.parse(readFileSync(path, 'utf8')).inputs).toEqual([{ content: 'comment body', turnId: '70001' }]);
+    writeFileSync(path, JSON.stringify({ version: 1, savedAtMs: 1000, inputs: [item] }));
+    expect(takeUnsentInputs(path, { nowMs: 2000 }).inputs).toEqual([{ content: 'comment body', turnId: '70001' }]);
+    expect(item.trustedCaller.requestUserOpenId).toBe('ou_author');
+  });
   it('saves only plain inputs and hands them back once', () => {
     const path = join(dir, 'turn-marks', 'a.unsent.json');
     const plain = { content: 'review PR 1931', turnId: 'om_1', turnCallerOpenId: 'ou_a', trustedCaller: { requestUserOpenId: 'ou_a' } as any };

@@ -52,9 +52,17 @@ export function isUnsentInputReplayable(item: PendingCliInput): boolean {
     && item.content.length > 0;
 }
 
+/** A saved comment is content only, not human authorization for the successor
+ * CLI. Both write and read sanitize so pre-upgrade journals cannot bypass it. */
+function anonymousRestoredComment(item: PendingCliInput): PendingCliInput {
+  if (!item.turnId || !/^\d+$/.test(item.turnId)) return item;
+  const { trustedCaller: _caller, turnCallerOpenId: _openId, ...anonymous } = item;
+  return anonymous;
+}
+
 /** Save the replayable inputs (nothing to save removes any older file). */
 export function saveUnsentInputs(path: string, items: readonly PendingCliInput[], nowMs: number = Date.now()): number {
-  const inputs = items.filter(isUnsentInputReplayable);
+  const inputs = items.filter(isUnsentInputReplayable).map(anonymousRestoredComment);
   if (inputs.length === 0) {
     rmSync(path, { force: true });
     return 0;
@@ -79,7 +87,8 @@ function readUnsentInputFile(path: string): { savedAtMs: number; inputs: Pending
   if (!parsed) return null;
   return {
     savedAtMs: parsed.savedAtMs,
-    inputs: parsed.inputs.filter(item => isJsonObject(item) && isUnsentInputReplayable(item as PendingCliInput)),
+    inputs: parsed.inputs.filter(item => isJsonObject(item) && isUnsentInputReplayable(item as PendingCliInput))
+      .map(anonymousRestoredComment),
   };
 }
 

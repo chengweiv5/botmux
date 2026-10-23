@@ -3811,6 +3811,31 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(send.mock.calls[0][0].trustedCaller).toBeUndefined();
     mocks.resolveVerifiedUserIdentity.mockReset();
   });
+  it.each(['reply-read', 'human-lookup'])('merges a same-author WS follower during poll-owned %s', async boundary => {
+    const sub = docSub(`fixture-positive-ws-follower-${boundary}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'positive follower');
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    const send = vi.fn(); ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    const ctx = { ...docCtx(sub, `positive-ws-${boundary}`), authorOpenId: 'ou_author', entrySource: 'poll' };
+    let release!: (value: any) => void;
+    const comment = { commentId: ctx.commentId, replies: [{ replyId: ctx.replyId, userId: 'ou_author', text: ctx.text }] };
+    if (boundary === 'reply-read') {
+      mocks.getDocComment.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+      mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce({ openId: 'ou_author', type: 'user' });
+    } else {
+      mocks.getDocComment.mockResolvedValueOnce(comment);
+      mocks.resolveVerifiedUserIdentity.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    }
+    const poll = handleDocComment(ctx);
+    await vi.waitFor(() => expect(boundary === 'reply-read' ? mocks.getDocComment : mocks.resolveVerifiedUserIdentity).toHaveBeenCalled());
+    const ws = handleDocComment({ ...ctx, entrySource: 'ws', operatorOpenId: 'ou_author' });
+    release(boundary === 'reply-read' ? comment : { openId: 'ou_author', type: 'user' });
+    expect(await Promise.all([poll, ws])).toEqual([true, true]);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].trustedCaller?.requestUserOpenId).toBe('ou_author');
+    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)?.requestUserOpenId).toBe('ou_author');
+  });
   it('revokes an already admitted comment when the duplicate WS event names a different editor', async () => {
     const sub = docSub('fixture-late-editor-veto');
     const ds = seedThreadSession(sub.sessionAnchor, 'late editor');

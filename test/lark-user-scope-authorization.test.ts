@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
@@ -23,6 +24,9 @@ beforeEach(async () => {
     worker: { killed: false }, workerGeneration: 4,
     managedTurnOrigin: { capability: CAP, turnId: 'om_turn', callerOpenId: 'ou_sender' },
   };
+  session.worker.pid = process.pid;
+  session.localProcessAttestation = { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid), workerGeneration: 4 };
+  session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'auth-session' ? session : undefined);
   vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } } as any);
   vi.spyOn(identities, 'getIdentity').mockReturnValue({ openId: 'ou_sender', type: 'user', source: 'sender', updatedAt: 0 } as any);

@@ -61,6 +61,7 @@ import {
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { docCommentHostOnlyPaths, assertDocCommentHostStorageOutsideWritableRoots } from './core/doc-comment-host-boundary.js';
+import { prepareDocCommentNegativeMaskRoot } from './platform/doc-comment-storage-root.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -22466,7 +22467,10 @@ async function spawnCli(
     mkdirSync(panePolicyDir, { recursive: true });
     const hideDirectories = new Set<string>();
     const hideFiles = new Set<string>();
+    const commentNegativeRoot = prepareDocCommentNegativeMaskRoot(isolationRuntimeDataDir);
+    hideDirectories.add(commentNegativeRoot);
     for (const path of docCommentHostOnlyPaths(isolationRuntimeDataDir)) {
+      if (path === join(isolationRuntimeDataDir, 'doc-comment-negative')) continue; // already prepared + validated above
       if (!existsSync(path)) continue;
       if (statSync(path).isDirectory()) hideDirectories.add(realpathSync(path));
       else hideFiles.add(realpathSync(path));

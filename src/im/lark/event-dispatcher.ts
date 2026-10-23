@@ -3505,6 +3505,7 @@ export interface EventHandlers {
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：一条命中文档绑定的评论被喂进
    *  会话。daemon 负责定位会话、投递给 worker、记录该轮回评论的落点。 */
   handleDocComment?: (ctx: DocCommentContext) => Promise<boolean>;
+  handleDocCommentIdentityVeto?: (ctx: DocCommentContext) => void;
   /** VC bot meeting push events (`vc.bot.meeting_*_v1`). ACK-safe; daemon owns meeting session state. */
   handleVcMeetingPush?: (ctx: VcMeetingPushContext) => Promise<void>;
   /** Best-effort hook before a human inbound turn reaches the CLI session. Used
@@ -3541,6 +3542,8 @@ export interface DocCommentContext {
   authorOpenId?: string;
   /** Event actor is a veto only, never the comment's authorization principal. */
   operatorOpenId?: string;
+  /** Fresh WS operator testimony only; poll/retry cannot prove an editor. */
+  entrySource?: 'ws' | 'poll' | 'retry';
 }
 
 /**
@@ -4382,6 +4385,11 @@ async function processCommentEvent(
   // is available, use its author for both audit paths instead of reporting '?'.
   // Preserve an explicit event operator (e.g. an edit by a different person).
   const requesterOpenId = parsed.operatorOpenId || trigger.userId;
+  if (parsed.operatorOpenId && parsed.operatorOpenId !== trigger.userId) {
+    handlers.handleDocCommentIdentityVeto?.({ larkAppId, sub, commentId,
+      replyId: trigger.replyId, authorOpenId: trigger.userId,
+      operatorOpenId: parsed.operatorOpenId, entrySource: 'ws', text: trigger.text });
+  }
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
@@ -4462,6 +4470,7 @@ async function processCommentEvent(
     isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
     operatorOpenId: parsed.operatorOpenId,
+    entrySource: 'ws',
   };
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
   // 标题补齐（只在缺时补，**故意不 await**）：评论事件热路径，用户在等回复，不能

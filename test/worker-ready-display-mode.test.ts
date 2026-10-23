@@ -174,6 +174,8 @@ import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } fro
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { registerDocCommentTurn } from '../src/core/doc-comment-turn-provenance.js';
+import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
@@ -299,6 +301,29 @@ describe('Worker ready: set_display_mode re-sync', () => {
     ds.workerGeneration = ds.session.workerGeneration = generation + 1;
     worker.emit('message', origin);
     expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    await flush();
+  });
+  it.each(['cli_lifetime_ended', 'claude_exit'] as const)('revokes old comment proof before a same-worker carryOver replay on %s', async event => {
+    const ds = makeDs(); const worker = ds.worker as any;
+    ds.session.larkAppId = ds.larkAppId;
+    setupActiveWorkerHandlers(ds, worker);
+    const generation = ds.workerGeneration!;
+    const target = { fileToken: 'fixture', fileType: 'docx', commentId: '70000', replyId: '70003', turnId: '70003' };
+    ds.session.docCommentTargets = { '70003': target };
+    registerDocCommentTurn(ds, { ...target, workerGeneration: generation, authorOpenId: 'ou_author' });
+    const tracker = new InflightInputTracker();
+    tracker.onWrite({ content: 'written comment', turnId: '70003' });
+    tracker.onTurnStarted('70003');
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'old', turnId: '70003' });
+    expect(ds.managedTurnOrigin?.callerOpenId).toBe('ou_author');
+    worker.emit('message', { type: event, sessionId: ds.session.sessionId, turnId: '70003', code: 0, signal: null });
+    tracker.onCliExit(); tracker.takeCarryOver();
+    const replay = tracker.takeStartedCarryOver()[0];
+    expect(replay.turnId).toBe('70003');
+    expect(ds.workerGeneration).toBe(generation);
+    worker.emit('message', { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'new', turnId: replay.turnId, callerOpenId: 'ou_author' });
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    expect(currentGatewayCallerOpenId(ds, replay.turnId!)).toBeUndefined();
     await flush();
   });
 

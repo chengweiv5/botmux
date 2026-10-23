@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, larkToolPassthroughEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { readManagedOriginCapability } from './core/managed-origin-capability.js';
 
 const isLarkAppId = (value: string): boolean => /^cli_[A-Za-z0-9]{4,64}$/.test(value);
 
@@ -21,7 +22,15 @@ async function main(): Promise<void> {
   if (!invocation.offline && !isPassthrough) {
     const port = binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
-    const payload = JSON.stringify({ mode: invocation.mode });
+    const isolated = !!process.env.BOTMUX_SEND_RELAY || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    const claim = invocation.mode === 'user' && isolated ? readManagedOriginCapability(
+      binding.dataDir, binding.sessionId, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    ) : undefined;
+    if (invocation.mode === 'user' && isolated && !claim?.turnId) throw new Error('Current turn authority unavailable');
+    const payload = JSON.stringify({ mode: invocation.mode, ...(claim ? {
+      originCapability: claim.capability, originTurnId: claim.turnId,
+      originDispatchAttempt: claim.dispatchAttempt, originChannelId: claim.channelId,
+    } : {}) });
     const response = await loopbackFetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(binding.sessionId)}/${LARK_TOOL_ROUTE}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
       body: payload, signal: AbortSignal.timeout(15_000),

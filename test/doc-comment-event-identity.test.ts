@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   addCommentReactionChecked: vi.fn(),
   getDocSubscription: vi.fn(),
   handleDocComment: vi.fn(),
+  handleDocCommentIdentityVeto: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', async importOriginal => ({
@@ -107,6 +108,7 @@ beforeEach(() => {
   mocks.addCommentReactionChecked.mockReset().mockResolvedValue({ ok: true });
   startLarkEventDispatcher(APP, 'test-secret', {
     handleDocComment: mocks.handleDocComment,
+    handleDocCommentIdentityVeto: mocks.handleDocCommentIdentityVeto,
   } as unknown as EventHandlers);
 });
 
@@ -200,6 +202,8 @@ describe('document comment event identity', () => {
     }));
     expect(mocks.settleDocCommentWsDelivery).toHaveBeenCalledWith(expect.any(String), APP, FILE,
       expect.objectContaining({ authorOpenId: OWNER, operatorOpenId: OTHER }), true);
+    expect(mocks.handleDocCommentIdentityVeto).toHaveBeenCalledWith(expect.objectContaining({ authorOpenId: OWNER, operatorOpenId: OTHER }));
+    expect(mocks.handleDocCommentIdentityVeto.mock.invocationCallOrder[0]).toBeLessThan(mocks.handleDocComment.mock.invocationCallOrder[0]);
   });
 
   it('正文不可读且触发者为 bot 自己时不发通知也不打失败标记', async () => {

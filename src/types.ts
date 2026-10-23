@@ -2218,6 +2218,7 @@ export type WorkerToDaemon =
    *  turn cold-starts on the new install. */
   | { type: 'cli_install_changed'; runningVersion: string; installedVersion: string }
   | { type: 'runner_build_ready'; runnerBuildId: string }
+  | { type: 'cli_lifetime_ended'; sessionId: string }
   | {
       type: 'restart_result';
       attemptId: string;

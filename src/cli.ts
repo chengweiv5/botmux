@@ -13876,7 +13876,7 @@ async function cmdAuth(rest: string[]): Promise<void> {
     const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
       || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
     let claim: ManagedOriginCapabilityClaim | undefined;
-    if (isolatedPane && !toolBinding) {
+    if (isolatedPane) {
       const read = readManagedOriginCapability(
         resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       );
@@ -13894,11 +13894,13 @@ async function cmdAuth(rest: string[]): Promise<void> {
       const authBody = parsed.command === 'request'
         ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
         : { requestId: parsed.requestId };
+      const originBody = claim ? { originCapability: claim.capability, originTurnId: claim.turnId,
+        originDispatchAttempt: claim.dispatchAttempt, originChannelId: claim.channelId } : {};
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
           method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': toolBinding.accessKey },
-          body: JSON.stringify(authBody), signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          body: JSON.stringify({ ...authBody, ...originBody }), signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
         })
         : await postCurrentSessionDaemonRoute({
           path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
@@ -13908,11 +13910,7 @@ async function cmdAuth(rest: string[]): Promise<void> {
           signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
           body: {
             ...authBody,
-            ...(claim ? {
-              originCapability: claim.capability,
-              originTurnId: claim.turnId,
-              originDispatchAttempt: claim.dispatchAttempt,
-            } : {}),
+            ...originBody,
           },
         });
       const body = await response.json() as { ok?: boolean; status?: string };

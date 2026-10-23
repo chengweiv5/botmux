@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import { registerDocCommentTurn, resolveDocCommentTurnCaller, isDocCommentTurn,
-  currentDocCommentHuman, forgetDocCommentTurn, clearDocCommentTurnProvenance } from '../src/core/doc-comment-turn-provenance.js';
+  currentDocCommentHuman, forgetDocCommentTurn, clearDocCommentTurnProvenance,
+  docCommentCliLifetime, revokeDocCommentCliLifetime } from '../src/core/doc-comment-turn-provenance.js';
 import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
 
 function fixture() {
@@ -69,5 +70,15 @@ describe('daemon-owned exact comment turn provenance', () => {
     forgetDocCommentTurn(ds, 'reply');
     expect(currentGatewayCallerOpenId(ds, 'reply')).toBeUndefined();
     expect(currentGatewayCallerOpenId(ds, 'next')).toBe('ou_next');
+  });
+  it('invalidates an admission read crossing a CLI restart without clearing unrelated IM identities', () => {
+    const { ds, record } = fixture();
+    const lifetime = docCommentCliLifetime(ds);
+    expect(revokeDocCommentCliLifetime(ds)).toBe(true);
+    registerDocCommentTurn(ds, { ...record, cliLifetime: lifetime });
+    expect(currentGatewayCallerOpenId(ds, 'reply')).toBeUndefined();
+    forgetDocCommentTurn(ds, 'reply');
+    ds.managedTurnOrigin = { turnId: 'om_fresh', capability: 'cap', callerOpenId: 'ou_IM' };
+    expect(revokeDocCommentCliLifetime(ds)).toBe(false);
   });
 });

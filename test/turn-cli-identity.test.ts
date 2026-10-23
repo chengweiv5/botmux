@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isDocCommentTurn, registerDocCommentTurn, resolveDocCommentTurnCaller } from '../src/core/doc-comment-turn-provenance.js';
+import { isDocCommentTurn, registerDocCommentTurn, resolveDocCommentTurnCaller, vetoDocCommentHuman } from '../src/core/doc-comment-turn-provenance.js';
 
 const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
@@ -50,7 +50,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
-const { sessionIdentityPath, writeSessionIdentity } = await import('../src/core/cli-identity.js');
+const { sessionIdentityPath, writeSessionIdentity, clearAllSessionIdentities } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 
@@ -419,6 +419,7 @@ describe('target daemon consumes signed message authority', () => {
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
       isDocCommentTurn, resolveDocCommentTurnCaller,
+      clearAllSessionIdentities,
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
@@ -670,6 +671,22 @@ describe('target daemon consumes signed message authority', () => {
     if (human) expect(content).toContain('comment-credential');
     else expect(content).not.toContain('comment-credential');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+  it('does not republish credentials after an editor veto arrives during the personal provider await', async () => {
+    const h = await targetHarness();
+    h.ds.session.larkAppId = APP; h.ds.session.status = 'active';
+    h.ds.workerGeneration = h.ds.session.workerGeneration = 3;
+    const target = { fileToken: 'fixture-veto-await', fileType: 'docx', commentId: 'comment', replyId: '70234', turnId: '70234' };
+    h.ds.session.docCommentTargets = { '70234': target };
+    registerDocCommentTurn(h.ds, { ...target, workerGeneration: 3, authorOpenId: 'ou_commentauthor' });
+    const provider = await import('../src/services/bytedcli-auth.js');
+    vi.mocked(provider.mintBytedcliJwts).mockImplementationOnce(async () => {
+      vetoDocCommentHuman(APP, target.fileToken, target.commentId, target.replyId);
+      return { cloudJwt: 'late-comment-secret' };
+    });
+    await h.run('70234');
+    const path = sessionIdentityPath(dir, SESSION, 'bytedcli');
+    expect(existsSync(path) ? readFileSync(path, 'utf8') : '').not.toContain('late-comment-secret');
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);

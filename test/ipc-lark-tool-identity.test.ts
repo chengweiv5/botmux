@@ -16,6 +16,7 @@ import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
 import { registerDocCommentTurn, clearDocCommentTurnProvenance } from '../src/core/doc-comment-turn-provenance.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
@@ -26,7 +27,7 @@ beforeEach(async () => {
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
     larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { killed: false },
-    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' },
+    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', originChannelId: 'ab'.repeat(32), callerOpenId: 'ou_sender' },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
@@ -45,8 +46,20 @@ afterEach(async () => {
 async function request(mode: string, accessKey = binding.accessKey) {
   return fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`, {
     method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': accessKey },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ mode, ...(mode === 'user' ? originTuple() : {}) }),
   });
+}
+function originTuple() {
+  return { originCapability: session.managedTurnOrigin?.capability, originTurnId: session.managedTurnOrigin?.turnId,
+    originDispatchAttempt: session.managedTurnOrigin?.dispatchAttempt, originChannelId: session.managedTurnOrigin?.originChannelId ?? 'ab'.repeat(32) };
+}
+function attestHostFixture() {
+  session.worker.pid = process.pid;
+  session.workerGeneration ??= 1;
+  session.localProcessAttestation = { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid),
+    workerGeneration: session.workerGeneration, backendType: 'pty', credentialIsolated: false };
+  session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
+  delete session.managedTurnOrigin.originChannelId;
 }
 describe('session application identity route', () => {
   function commentTurn(turnId = 'reply_comment', author = 'ou_author') {
@@ -56,9 +69,82 @@ describe('session application identity route', () => {
       replyToOpenId: 'ou_owner' };
     (session.session.docCommentTargets ??= {})[turnId] = target;
     registerDocCommentTurn(session, { ...target, workerGeneration: 1, authorOpenId: author });
-    session.managedTurnOrigin = { turnId, capability: 'comment_cap', callerOpenId: author };
+    session.managedTurnOrigin = { turnId, capability: 'comment_cap', originChannelId: 'ab'.repeat(32), callerOpenId: author };
     return target;
   }
+  it('rejects a previous turn background process holding only the persistent binding key before token/OAuth providers', async () => {
+    commentTurn('reply_new', 'ou_newauthor');
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_newauthor', type: 'user' });
+    const authProvider = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/fixture',
+      scopes: ['im:chat:read'], expiresIn: 600, poll: vi.fn() } as any);
+    const stale = (route: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${route}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+    });
+    expect((await stale('lark-tool-identity', { mode: 'user' })).status).toBe(403);
+    expect((await stale('auth-request', { scopes: ['im:chat:read'] })).status).toBe(403);
+    expect((await stale('auth-status', { requestId: 'old-request' })).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    expect(authProvider).not.toHaveBeenCalled();
+  });
+  it.skipIf(process.platform !== 'linux')('rejects a real preexisting background PID with the old key while allowing a fresh host request', async () => {
+    commentTurn('reply_host', 'ou_host');
+    attestHostFixture();
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_host', type: 'user' });
+    const child = spawnTsScript(join(process.cwd(), 'test/fixtures/lark-stale-key-client.ts'), [], {
+      env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once('message', () => resolve()); child.once('error', reject); });
+      session.managedTurnOrigin.preexistingProcessIdentities.push(`${child.pid}:${readProcessStartIdentity(child.pid!)}`);
+      const result = new Promise<any>(resolve => child.once('message', resolve));
+      child.send({ port: ipc!.port, accessKey: binding.accessKey });
+      expect(await result).toEqual({ statuses: [403, 403, 403] });
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ mode: 'user' }),
+      });
+      expect(response.status).toBe(200);
+    } finally { child.kill('SIGKILL'); }
+  });
+  it.each(['capability', 'turn', 'channel'])('rejects a stale isolated %s before providers', async mismatch => {
+    commentTurn();
+    const tuple = originTuple();
+    if (mismatch === 'capability') tuple.originCapability = 'stale';
+    if (mismatch === 'turn') tuple.originTurnId = 'old-turn';
+    if (mismatch === 'channel') tuple.originChannelId = 'cd'.repeat(32);
+    for (const [route, body] of [['lark-tool-identity', { mode: 'user' }], ['auth-request', { scopes: ['im:chat:read'] }], ['auth-status', { requestId: 'old' }]] as const) {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${route}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ ...body, ...tuple }),
+      });
+      expect(response.status).toBe(403);
+    }
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('rechecks lineage after identity awaits, before requesting a personal token', async () => {
+    commentTurn('reply_host_await', 'ou_host');
+    attestHostFixture();
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async () => {
+      session.localProcessAttestation.cliProcStart = 'stale-lifetime';
+      return { openId: 'ou_host', type: 'user' };
+    });
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ mode: 'user' }),
+    });
+    expect(response.status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('refuses an auth-status caller whose channel changed while polling', async () => {
+    commentTurn();
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_author', type: 'user' });
+    const poll = vi.fn(async () => { session.managedTurnOrigin.originChannelId = 'ef'.repeat(32); return { status: 'ready' as const, token: 'fixture-grant' }; });
+    vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/fixture', scopes: ['im:chat:read'], expiresIn: 300, poll });
+    const post = (route: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${route}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ ...body, ...originTuple() }),
+    });
+    const request = await (await post('auth-request', { scopes: ['im:chat:read'] })).json();
+    expect(request.ok).toBe(true);
+    expect((await post('auth-status', { requestId: request.requestId })).status).toBe(403);
+  });
   it('connects exact comment author to bound --as user and auth request/status without trigger-user policy', async () => {
     commentTurn();
     vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_author', type: 'user' });
@@ -68,7 +154,7 @@ describe('session application identity route', () => {
     vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/fixture-auth',
       scopes: ['im:chat:read'], expiresIn: 300, poll });
     const auth = (action: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${action}`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ ...body, ...originTuple() }),
     });
     const grant = await (await auth('auth-request', { scopes: ['im:chat:read'] })).json();
     expect(grant.ok).toBe(true);
@@ -170,7 +256,7 @@ describe('session application identity route', () => {
     });
     const auth = (action: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${action}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, ...originTuple() }),
     });
     const grant = await (await auth('auth-request', { scopes: ['im:chat:read'] })).json();
     expect(grant).toMatchObject({ ok: true, authUrl: expect.stringContaining('accounts.feishu.cn') });
@@ -203,7 +289,7 @@ describe('session application identity route', () => {
     await delegate({ targetOpenId: 'ou_later', turnId: 'om_queued' });
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
-    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', originChannelId: 'ab'.repeat(32), callerOpenId: 'ou_sender' };
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
@@ -262,7 +348,7 @@ describe('session application identity route', () => {
     expect(await (await request('bot')).json()).toMatchObject({ credential: 'refreshed-token' });
     expect(post).toHaveBeenCalledTimes(2);
   });
-  it('uses the same user path on macOS without process attestation', async () => {
+  it('uses a current channel tuple on macOS without Linux process attestation', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
     const response = await request('user');
     expect(response.status).toBe(200);
@@ -275,7 +361,7 @@ describe('session application identity route', () => {
     vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/app-authorization',
       scopes: ['sheets:spreadsheet:read'], expiresIn: 300, poll });
     const post = (action: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${action}`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify({ ...body, ...originTuple() }),
     });
     const response = await post('auth-request', { scopes: ['sheets:spreadsheet:read'] });
     expect(response.status).toBe(200);
@@ -300,6 +386,7 @@ describe('session application identity route', () => {
     expect(response.status).toBe(409); expect(await response.text()).not.toContain('wrong-turn-token');
   });
   it('runs the real tool process with only the selected application credentials', async () => {
+    attestHostFixture();
     const real = join(dir, 'real-lark');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
     binding.realBinary = real; writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
@@ -418,7 +505,7 @@ describe('platform-issued user credentials in a bound session', () => {
     const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
     const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
-      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+      body: JSON.stringify({ scopes: ['search:docs:read'], ...originTuple() }),
     });
     expect(response.status).toBe(409);
     expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
@@ -430,13 +517,14 @@ describe('platform-issued user credentials in a bound session', () => {
     const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
     const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
-      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+      body: JSON.stringify({ scopes: ['search:docs:read'], ...originTuple() }),
     });
     expect(response.status).toBe(403);
     expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
     expect(deviceFlow).not.toHaveBeenCalled();
   });
   it('runs the real tool with the platform application for user calls and the bound one for bot calls', async () => {
+    attestHostFixture();
     installFakeTool();
     vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
     const user = await runTool(['docs', '+fetch', '--as=user'], ipc!.port); expect(user.code, user.err).toBe(0);

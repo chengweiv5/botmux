@@ -116,6 +116,7 @@ import { CURRENT_EXECUTION_ROUTE, CURRENT_EXECUTION_SCHEMA } from '../cli/curren
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import {
   attestCurrentTurnLoopbackPeer,
+  currentTurnPeerAttestationStable,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -524,7 +525,7 @@ import {
   sessionPreviewDescriptor,
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
-import { isDocCommentTurn, currentDocCommentHuman } from './doc-comment-turn-provenance.js';
+import { isDocCommentTurn, currentDocCommentHuman, docCommentCliLifetime } from './doc-comment-turn-provenance.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
@@ -3063,6 +3064,45 @@ function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: s
   } catch { return false; }
 }
 
+/** App-selection keys are deliberately durable; they never prove who is
+ * executing this HTTP request. Require a fresh channel tuple or host lineage. */
+function currentUserRequestProof(
+  req: IncomingMessage, ds: DaemonSession, body: Record<string, unknown>, boundTool: boolean,
+): (() => boolean) | undefined {
+  const origin = ds.managedTurnOrigin;
+  const worker = ds.worker;
+  if (!origin?.turnId || !origin.capability || !worker || worker.killed) return;
+  const session = ds.session;
+  const appId = ds.larkAppId;
+  const generation = ds.workerGeneration;
+  const lifetime = docCommentCliLifetime(ds);
+  const snapshot = { ...origin };
+  const stillCurrent = () => findActiveBySessionId(session.sessionId) === ds
+    && ds.session === session && session.status === 'active' && ds.larkAppId === appId
+    && ds.worker === worker && !worker.killed && ds.workerGeneration === generation
+    && docCommentCliLifetime(ds) === lifetime && !sessionTransportDisabled(ds)
+    && ds.managedTurnOrigin?.turnId === snapshot.turnId
+    && ds.managedTurnOrigin?.capability === snapshot.capability
+    && ds.managedTurnOrigin?.originChannelId === snapshot.originChannelId
+    && ds.managedTurnOrigin?.dispatchAttempt === snapshot.dispatchAttempt
+    && ds.managedTurnOrigin?.callerOpenId === snapshot.callerOpenId;
+  const tuple = ['originCapability', 'originTurnId', 'originDispatchAttempt', 'originChannelId']
+    .some(key => key in body);
+  if (tuple) {
+    if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
+      || body.originDispatchAttempt !== origin.dispatchAttempt
+      || (origin.originChannelId ? body.originChannelId !== origin.originChannelId
+        : boundTool || body.originChannelId !== undefined)) return;
+    return stillCurrent;
+  }
+  const peer = resolveLoopbackPeerProcesses({ remoteAddress: req.socket.remoteAddress,
+    remotePort: req.socket.remotePort, localPort: req.socket.localPort });
+  if (!peer.ok) return;
+  const input = { sessionId: session.sessionId, peer: peer.peer, findSession: findActiveBySessionId };
+  const proof = attestCurrentTurnLoopbackPeer(input);
+  return proof ? () => stillCurrent() && currentTurnPeerAttestationStable(proof, input) : undefined;
+}
+
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
   let body: Record<string, unknown>;
   try { body = await readBoundedJsonBody(req, 4096, 1000); }
@@ -3074,7 +3114,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
-  if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
+  if (!body || Object.keys(body).some(key => !['mode', 'originCapability', 'originTurnId', 'originDispatchAttempt', 'originChannelId'].includes(key)) || !['bot', 'user'].includes(String(body.mode))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
@@ -3101,6 +3141,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const origin = ds.managedTurnOrigin;
+  const requestProof = currentUserRequestProof(req, ds, body, true);
+  if (!requestProof?.()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   const originSender = origin?.callerOpenId;
   const turnId = origin?.turnId;
   if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
@@ -3127,6 +3169,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!user || user.type !== 'user' || user.openId !== sender) {
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
+  if (!requestProof()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   // The bot application's own grant first (the owner keeps its wider scopes);
   // anyone else can only get credentials through the platform, since a bot
   // app's availability range normally excludes them.
@@ -3143,6 +3186,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
+  if (!requestProof()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   if (!resolved.ok && resolved.reason === 'platform') {
     return jsonRes(res, 403, { ok: false, error: resolved.error, ...(resolved.authorizeUrl ? { authorizeUrl: resolved.authorizeUrl } : {}) });
   }
@@ -3242,25 +3286,8 @@ for (const action of ['auth-request', 'auth-status']) {
     //    proves lineage the way `/api/current-actor` does — the daemon maps the
     //    loopback socket to the client pid and walks it to the live CLI. Never
     //    let a partial/stale tuple fall through to the host path.
-    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
-      || 'originDispatchAttempt' in body;
-    if (presentsOriginTuple) {
-      if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
-        || body.originDispatchAttempt !== origin.dispatchAttempt) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
-      }
-    } else if (!boundTool) {
-      const peer = resolveLoopbackPeerProcesses({
-        remoteAddress: req.socket.remoteAddress,
-        remotePort: req.socket.remotePort,
-        localPort: req.socket.localPort,
-      });
-      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
-        sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
-      })) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
-      }
-    }
+    const requestProof = currentUserRequestProof(req, ds, body, boundTool);
+    if (!requestProof?.()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
     const cfg = getBot(ds.larkAppId).config;
     // Only the daemon's verified, turn-bound dispatch can supply a delegated
     // human. The CLI still cannot choose a user or an application.
@@ -3287,6 +3314,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const worker = ds.worker;
     const generation = ds.workerGeneration;
     const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
+      && requestProof()
       && ds.session.status === 'active' && ds.worker === worker && !worker.killed
       && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === originCallerOpenId
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
@@ -3314,6 +3342,7 @@ for (const action of ['auth-request', 'auth-status']) {
         return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
       }
       const result = await request.poll();
+      if (!requestProof()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
       if (result.status === 'failed') {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
@@ -3396,6 +3425,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestId = randomBytes(32).toString('hex');
     const brand = normalizeBrand(cfg.brand);
     const appSecret = cfg.larkAppSecret;
+    const commentAuthorizationLifetime = isDocCommentTurn(ds, turnId) ? docCommentCliLifetime(ds) : undefined;
     let accepted = false;
     const isAuthorizationValid = () => {
       // During issuance the originating turn must still be the live one.
@@ -3405,6 +3435,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const live = findActiveBySessionId(params.sessionId);
       if (live !== ds || ds.session.status !== 'active' || !ds.worker || ds.worker.killed
         || ds.larkAppId !== appId || sessionTransportDisabled(ds)) return false;
+      if (commentAuthorizationLifetime !== undefined && docCommentCliLifetime(ds) !== commentAuthorizationLifetime) return false;
       // While no turn is live (the gap after the Agent ended the originating
       // turn), the daemon may keep completing the grant server-side. Once a new
       // turn has an effective user — including a delegated target — it must be

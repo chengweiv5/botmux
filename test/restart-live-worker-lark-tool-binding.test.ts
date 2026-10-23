@@ -4,10 +4,12 @@ import { join } from 'node:path';
 import {
   latestLarkToolBindingForRespawn,
   requestSessionRestart,
+  currentGatewayCallerOpenId,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
 import * as botRegistry from '../src/bot-registry.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { registerDocCommentTurn, currentDocCommentHuman } from '../src/core/doc-comment-turn-provenance.js';
 
 describe('latestLarkToolBindingForRespawn (daemon-side carrier)', () => {
   const makeSession = (appId = 'cli_test'): DaemonSession => ({
@@ -46,6 +48,22 @@ describe('requestSessionRestart live-worker branch carries larkToolBinding', () 
   afterEach(() => {
     __testOnly_resetRestartCoordinator();
     vi.restoreAllMocks();
+  });
+  it('revokes a written comment on real in-worker restart even when worker generation stays the same', () => {
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_test' } } as any);
+    const target = { fileToken: 'fixture', fileType: 'docx', commentId: '70000', replyId: '70001', turnId: '70001' };
+    const ds = { larkAppId: 'cli_test', workerGeneration: 1,
+      session: { sessionId: 'restart-comment', larkAppId: 'cli_test', status: 'active', workerGeneration: 1, docCommentTargets: { '70001': target } },
+      worker: { killed: false, send: vi.fn() },
+      managedTurnOrigin: { turnId: '70001', capability: 'old-cap', callerOpenId: 'ou_author' },
+    } as unknown as DaemonSession;
+    registerDocCommentTurn(ds, { ...target, workerGeneration: 1, authorOpenId: 'ou_author' });
+    expect(currentDocCommentHuman(ds, '70001')).toBe('ou_author');
+    requestSessionRestart(ds, { source: 'slash', notify: vi.fn(async () => {}) } as any);
+    expect(ds.workerGeneration).toBe(1);
+    ds.managedTurnOrigin = { turnId: '70001', capability: 'replay-cap', callerOpenId: 'ou_author' };
+    expect(currentGatewayCallerOpenId(ds, '70001')).toBeUndefined();
+    expect(currentDocCommentHuman(ds, '70001')).toBeUndefined();
   });
 
   it.each([

@@ -3790,6 +3790,43 @@ describe('document comment canonical ownership and single-flight delivery', () =
     });
     putDocSubscription(config.session.dataDir, APP, sub);
   }
+  it('keeps poll anonymous when a mismatched WS editor follows its in-flight exact reply read', async () => {
+    const sub = docSub('fixture-poll-editor-race');
+    const ds = seedThreadSession(sub.sessionAnchor, 'poll editor');
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    const send = vi.fn(); ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    const ctx = { ...docCtx(sub, 'poll-editor'), authorOpenId: 'ou_author', entrySource: 'poll' };
+    let release!: (value: any) => void;
+    mocks.getDocComment.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    mocks.resolveVerifiedUserIdentity.mockResolvedValue({ openId: 'ou_author', type: 'user' });
+    const poll = handleDocComment(ctx);
+    await vi.waitFor(() => expect(mocks.getDocComment).toHaveBeenCalled());
+    const ws = handleDocComment({ ...ctx, entrySource: 'ws', operatorOpenId: 'ou_editor' });
+    release({ commentId: ctx.commentId, replies: [{ replyId: ctx.replyId, userId: 'ou_author', text: ctx.text }] });
+    expect(await Promise.all([poll, ws])).toEqual([true, true]);
+    expect(mocks.getDocComment).toHaveBeenCalledTimes(1);
+    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toBeUndefined();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].trustedCaller).toBeUndefined();
+    mocks.resolveVerifiedUserIdentity.mockReset();
+  });
+  it('revokes an already admitted comment when the duplicate WS event names a different editor', async () => {
+    const sub = docSub('fixture-late-editor-veto');
+    const ds = seedThreadSession(sub.sessionAnchor, 'late editor');
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    bindSubToSession(sub, ds);
+    const ctx = { ...docCtx(sub, 'late-editor'), authorOpenId: 'ou_author', operatorOpenId: 'ou_author', entrySource: 'ws' };
+    mocks.getDocComment.mockResolvedValueOnce({ commentId: ctx.commentId, replies: [{ replyId: ctx.replyId, userId: 'ou_author', text: ctx.text }] });
+    mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce({ openId: 'ou_author', type: 'user' });
+    expect(await handleDocComment(ctx)).toBe(true);
+    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toBeDefined();
+    ds.managedTurnOrigin = { turnId: ctx.replyId, capability: 'fixture', callerOpenId: 'ou_author' };
+    expect(await handleDocComment({ ...ctx, operatorOpenId: 'ou_editor' })).toBe(true);
+    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toBeUndefined();
+    expect(ds.managedTurnOrigin.callerOpenId).toBeUndefined();
+  });
 
   it.each(['live', 'refork', 'adopt'] as const)('binds fresh reply author before %s worker input, never owner', async mode => {
     const sub = docSub(`fixture-human-${mode}`);
@@ -3798,7 +3835,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     ds.session.ownerOpenId = 'ou_unrelated';
     ds.session.lastCallerOpenId = 'ou_oldIM';
     bindSubToSession(sub, ds);
-    const ctx = { ...docCtx(sub, mode), authorOpenId: 'ou_author' };
+    const ctx = { ...docCtx(sub, mode), authorOpenId: 'ou_author', operatorOpenId: 'ou_author', entrySource: 'ws' };
     mocks.getDocComment.mockResolvedValueOnce({ commentId: ctx.commentId,
       replies: [{ replyId: ctx.replyId, userId: 'ou_author', text: ctx.text }] });
     mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce({ openId: 'ou_author', type: 'user' });
@@ -3832,8 +3869,8 @@ describe('document comment canonical ownership and single-flight delivery', () =
       ds.workerGeneration = ds.session.workerGeneration = 1;
       const send = vi.fn(); ds.worker = { killed: false, send } as any;
       bindSubToSession(sub, ds);
-      const ctx = { ...docCtx(sub, boundary), authorOpenId: 'ou_author',
-        ...(boundary === 'operator' ? { operatorOpenId: 'ou_editor' } : {}) };
+      const ctx = { ...docCtx(sub, boundary), authorOpenId: 'ou_author', entrySource: 'ws',
+        operatorOpenId: boundary === 'operator' ? 'ou_editor' : 'ou_author' };
       mocks.getDocComment.mockResolvedValueOnce(boundary === 'unreadable' ? null : {
         commentId: ctx.commentId, replies: [{ replyId: boundary === 'missing-reply' ? 'wrong' : ctx.replyId,
           userId: boundary === 'author' ? 'ou_different' : 'ou_author',

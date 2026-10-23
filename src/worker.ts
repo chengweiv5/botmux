@@ -18569,6 +18569,10 @@ async function spawnCli(
   if (networkError) throw new Error(networkError);
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError);
+  if (cliSpawnGeneration > 0) {
+    send({ type: 'cli_lifetime_ended', sessionId });
+    scrubReplayedCommentCaller(cfg);
+  }
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
   restartInterruptionScanBeforeMs = undefined;
@@ -23724,6 +23728,7 @@ async function spawnCli(
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
     }
+    send({ type: 'cli_lifetime_ended', sessionId });
     if (codexAutoUpgrade) {
       backend = null;
       isPromptReady = false;
@@ -23866,8 +23871,12 @@ async function spawnCli(
     // only it is excluded, from BOTH the inflight carry-over and the still-queued
     // pendingMessages.
     const stashed = inflightInputs.onCliExit(
-      item => item.dispatchAttempt === undefined && !item.noReplay,
+      item => {
+        scrubReplayedCommentCaller(item);
+        return item.dispatchAttempt === undefined && !item.noReplay;
+      },
     );
+    for (const item of pendingMessages) scrubReplayedCommentCaller(item);
     if (stashed > 0) {
       log(`CLI exited with ${stashed} in-flight message(s); will re-queue after restart`);
     }
@@ -24147,6 +24156,12 @@ function restoreMojoLivePatchAfterRespawn(): void {
   log(`Restored live mojo JWT state after backend replacement (${remembered.jwt === null ? 'cleared' : 'rotated'})`);
 }
 
+function scrubReplayedCommentCaller(item: { turnId?: string; trustedCaller?: TrustedCaller; turnCallerOpenId?: string }): void {
+  if (!item.turnId || !/^\d+$/.test(item.turnId)) return;
+  delete item.trustedCaller;
+  delete item.turnCallerOpenId;
+}
+
 function killCli(opts: {
   preservePending?: boolean;
   preserveInjections?: boolean;
@@ -24161,6 +24176,12 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  send({ type: 'cli_lifetime_ended', sessionId });
+  for (const item of pendingMessages) scrubReplayedCommentCaller(item);
+  if (lastInitConfig?.turnId && /^\d+$/.test(lastInitConfig.turnId)) {
+    delete lastInitConfig.trustedCaller;
+    delete lastInitConfig.turnCallerOpenId;
+  }
   if (backend) previousCliEndedAtMs = Date.now();
   inputDeliveryQuarantine = null;
   postTerminalInputFence = null;

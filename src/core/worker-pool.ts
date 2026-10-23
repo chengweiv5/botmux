@@ -137,7 +137,7 @@ import { readGroupContextAuthorOrigin } from '../services/group-context-publicat
 import { bindGroupContextWorkerGeneration, readGroupContextDeliveryBinding, hasPreparedGroupContext, type GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../services/group-context-prompt.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
-import { isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn, clearDocCommentTurnProvenance } from './doc-comment-turn-provenance.js';
+import { isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn, clearDocCommentTurnProvenance, revokeDocCommentCliLifetime } from './doc-comment-turn-provenance.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
@@ -6809,6 +6809,7 @@ export function requestSessionRestart(
   const result = restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
     try {
       if (ds.worker && !ds.worker.killed) {
+        if (revokeDocCommentCliLifetime(ds)) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
@@ -15757,11 +15758,26 @@ function setupWorkerHandlers(
         acknowledgeSessionReady(msg.requestId);
         break;
       }
+      case 'cli_lifetime_ended': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+          || msg.sessionId !== ds.session.sessionId) break;
+        if (revokeDocCommentCliLifetime(ds)) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
+        if (ds.managedTurnOrigin?.turnId && isDocCommentTurn(ds, ds.managedTurnOrigin.turnId)) {
+          delete ds.managedTurnOrigin.callerOpenId;
+        }
+        break;
+      }
       case 'local_process_attestation': {
         // This message arrives over the private parent<->worker IPC channel;
         // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
         // Bind it to the daemon's current worker generation so a late message
         // from a replaced worker never attests the replacement process.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        const previous = ds.localProcessAttestation;
+        if (previous && (previous.cliPid !== undefined && (previous.cliPid !== msg.cliPid || previous.cliProcStart !== msg.cliProcStart)
+          || previous.enginePid !== undefined && (previous.enginePid !== msg.enginePid || previous.engineProcStart !== msg.engineProcStart))) {
+          if (revokeDocCommentCliLifetime(ds)) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
+        }
         ds.localProcessAttestation = {
           backendType: msg.backendType,
           credentialIsolated: msg.credentialIsolated,
@@ -17426,6 +17442,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        if (revokeDocCommentCliLifetime(ds)) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
         // The original opted-in turn has no dispatchAttempt, so worker.ts's
         // durable-delivery terminal path cannot report its CLI exit. Bind the
         // exit here to the exact live turn + worker generation. Synthetic

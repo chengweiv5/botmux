@@ -8,6 +8,9 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';
 import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
 import { restartInterruptionNote, restartInterruptionNotice } from '../src/services/restart-interruption.js';
+import { registerDocCommentTurn, currentDocCommentHuman, revokeDocCommentCliLifetime,
+  resolveDocCommentTurnCaller } from '../src/core/doc-comment-turn-provenance.js';
+import type { DaemonSession } from '../src/core/types.js';
 
 // The real worker resumes a fake Pi whose previous process died mid-turn (the
 // 10-21 tmux server loss): the resumed CLI must receive the restart note and
@@ -139,6 +142,46 @@ async function crashAndRestart(env: ReturnType<typeof setup>, w: ReturnType<type
 }
 
 describe('worker restart interruption notice (real worker, fake Pi)', () => {
+  it.each([false, true])('keeps real crash carryOver replay anonymous until a fresh comment admission (nativeStart=%s)', async nativeStart => {
+    const env = setup(`comment-crash-lifetime-${nativeStart}`, { recordTurns: nativeStart });
+    const w = startWorker(env);
+    await waitUntil(() => w.messages.some(msg => msg.type === 'prompt_ready'), w.logs);
+    const target = { fileToken: 'fixture', fileType: 'docx', commentId: '70080', replyId: '70081', turnId: '70081' };
+    const ds = { larkAppId: 'app_test', workerGeneration: 1, worker: child,
+      session: { sessionId: env.sid, larkAppId: 'app_test', status: 'active', workerGeneration: 1, docCommentTargets: { '70081': target } },
+    } as unknown as DaemonSession;
+    registerDocCommentTurn(ds, { ...target, workerGeneration: 1, authorOpenId: 'ou_author' });
+    child!.on('message', (msg: WorkerToDaemon) => {
+      if (msg.type === 'cli_lifetime_ended') revokeDocCommentCliLifetime(ds);
+      if (msg.type === 'managed_turn_origin') ds.managedTurnOrigin = { ...msg,
+        callerOpenId: msg.turnId ? resolveDocCommentTurnCaller(ds, msg.turnId)?.requestUserOpenId : undefined };
+    });
+    child!.send({ type: 'message', content: 'comment lost to CLI crash', turnId: '70081',
+      trustedCaller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_author', senderType: 'user' } } satisfies DaemonToWorker);
+    await waitUntil(() => !!env.processInput(0)?.includes('comment lost to CLI crash')
+      && currentDocCommentHuman(ds, '70081') === 'ou_author', w.logs);
+    const start = w.messages.length;
+    if (nativeStart) {
+      await waitUntil(() => readFileSync(env.transcript, 'utf8').includes('comment lost to CLI crash'), w.logs);
+      await new Promise(done => setTimeout(done, 1_500));
+    }
+    await crashAndRestart(env, w);
+    let replayProcess = 1;
+    if (nativeStart) {
+      await waitUntil(() => (w.logs.join('').match(/Spawning fresh CLI/g) ?? []).length >= 2, w.logs);
+      writeFileSync(env.crashFlag, '1');
+      await waitUntil(() => w.messages.filter(msg => msg.type === 'claude_exit').length >= 2, w.logs);
+      child!.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+      await waitUntil(() => w.logs.join('').includes('Resume fallback: dropping --resume'), w.logs);
+      replayProcess = 2;
+    }
+    await waitUntil(() => !!env.processInput(replayProcess)?.includes('comment lost to CLI crash'), w.logs);
+    await waitUntil(() => w.messages.slice(start).some(msg => msg.type === 'managed_turn_origin' && msg.turnId === '70081'), w.logs);
+    expect(w.messages.slice(start).some(msg => msg.type === 'cli_lifetime_ended')).toBe(true);
+    expect(ds.workerGeneration).toBe(1);
+    expect(currentDocCommentHuman(ds, '70081')).toBeUndefined();
+    expect(readFileSync(join(env.dataDir, 'cli-identity', `${env.sid}.bin`, '.data', 'turn'), 'utf8').split('\n')[1]).not.toBe('ou_author');
+  }, 60_000);
   it('does not re-run a turn the CLI already started; hands it the note under that turn instead (#1650 on 10-21)', async () => {
     // The CLI wrote the message's user record and was working on it (mid tool
     // call) when the pane went away, twice.

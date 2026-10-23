@@ -11,6 +11,7 @@ interface CommentTurnRecord {
   replyId: string;
   turnId: string;
   workerGeneration: number;
+  cliLifetime: number;
   /** Absent means an admitted comment without positive human testimony. */
   authorOpenId?: string;
 }
@@ -18,14 +19,36 @@ interface CommentTurnRecord {
 // Host memory only: never restore authority from a Session projection, CLI
 // payload, subscription owner, display cache, or document reply destination.
 const records = new WeakMap<DaemonSession, Map<string, CommentTurnRecord>>();
+const cliLifetimes = new WeakMap<DaemonSession, number>();
+const vetoes = new Set<string>();
+const commentKey = (app: string, file: string, comment: string, reply: string) => JSON.stringify([app, file, comment, reply]);
+
+export function docCommentCliLifetime(ds: DaemonSession): number {
+  return cliLifetimes.get(ds) ?? 0;
+}
+
+/** Restart/exit invalidates even an in-flight read that has not registered yet. */
+export function revokeDocCommentCliLifetime(ds: DaemonSession): boolean {
+  const hadHuman = [...(records.get(ds)?.values() ?? [])].some(record => !!record.authorOpenId);
+  cliLifetimes.set(ds, docCommentCliLifetime(ds) + 1);
+  for (const record of records.get(ds)?.values() ?? []) record.authorOpenId = undefined;
+  return hadHuman
+    || !!ds.managedTurnOrigin?.turnId && isDocCommentTurn(ds, ds.managedTurnOrigin.turnId);
+}
+
+/** Ingress veto is independent of delivery claim ownership and survives later
+ * admission/retry. An operator is only negative testimony, never a principal. */
+export function vetoDocCommentHuman(app: string, file: string, comment: string, reply: string): void {
+  vetoes.add(commentKey(app, file, comment, reply));
+}
 
 export function registerDocCommentTurn(
   ds: DaemonSession,
-  input: Omit<CommentTurnRecord, 'session' | 'appId' | 'sessionId'>,
+  input: Omit<CommentTurnRecord, 'session' | 'appId' | 'sessionId' | 'cliLifetime'> & { cliLifetime?: number },
 ): void {
   const turns = records.get(ds) ?? new Map<string, CommentTurnRecord>();
   records.set(ds, turns);
-  turns.set(input.turnId, { ...input, session: ds.session,
+  turns.set(input.turnId, { ...input, cliLifetime: input.cliLifetime ?? docCommentCliLifetime(ds), session: ds.session,
     appId: ds.larkAppId, sessionId: ds.session.sessionId });
 }
 
@@ -48,6 +71,8 @@ export function resolveDocCommentTurnCaller(ds: DaemonSession, turnId: string): 
     || !Number.isSafeInteger(record.workerGeneration) || record.workerGeneration <= 0
     || record.workerGeneration !== ds.workerGeneration
     || record.workerGeneration !== ds.session.workerGeneration
+    || record.cliLifetime !== docCommentCliLifetime(ds)
+    || vetoes.has(commentKey(record.appId, record.fileToken, record.commentId, record.replyId))
     || target.turnId !== turnId || target.fileToken !== record.fileToken
     || target.fileType !== record.fileType || target.commentId !== record.commentId
     || target.replyId !== record.replyId) return undefined;

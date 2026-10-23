@@ -1,5 +1,8 @@
 import type { DaemonSession } from './types.js';
 import type { Session, TrustedCaller } from '../types.js';
+import { config } from '../config.js';
+import { DocCommentNegativeStore } from '../services/doc-comment-negative-store.js';
+import { logger } from '../utils/logger.js';
 
 interface CommentTurnRecord {
   session: Session;
@@ -20,23 +23,16 @@ interface CommentTurnRecord {
 // payload, subscription owner, display cache, or document reply destination.
 const records = new WeakMap<DaemonSession, Map<string, CommentTurnRecord>>();
 const cliLifetimes = new WeakMap<DaemonSession, number>();
-/** Never evict a negative while a pending retry can still name it. Once full,
- * withhold all comment-human grants until daemon restart rather than resurrect
- * an evicted reply. Memory stays bounded even for unbounded edit traffic. */
-export class DocCommentVetoLedger {
-  private readonly entries = new Set<string>();
-  private saturated = false;
-  constructor(private readonly capacity = 5_000) {}
-  add(key: string): void {
-    if (this.entries.has(key) || this.saturated) return;
-    if (this.entries.size >= this.capacity) { this.saturated = true; return; }
-    this.entries.add(key);
+/** Exact negatives live on disk, with a bounded connection working set. */
+let negativeStore: DocCommentNegativeStore | undefined;
+let negativeDataDir: string | undefined;
+function negatives(): DocCommentNegativeStore {
+  if (!negativeStore || negativeDataDir !== config.session.dataDir) {
+    negativeStore?.close(); negativeDataDir = config.session.dataDir;
+    negativeStore = new DocCommentNegativeStore(negativeDataDir);
   }
-  has(key: string): boolean { return this.saturated || this.entries.has(key); }
-  get size(): number { return this.entries.size; }
+  return negativeStore;
 }
-const vetoes = new DocCommentVetoLedger();
-const commentKey = (app: string, file: string, comment: string, reply: string) => JSON.stringify([app, file, comment, reply]);
 
 export function docCommentCliLifetime(ds: DaemonSession): number {
   return cliLifetimes.get(ds) ?? 0;
@@ -54,7 +50,12 @@ export function revokeDocCommentCliLifetime(ds: DaemonSession): boolean {
 /** Ingress veto is independent of delivery claim ownership and survives later
  * admission/retry. An operator is only negative testimony, never a principal. */
 export function vetoDocCommentHuman(app: string, file: string, comment: string, reply: string): void {
-  vetoes.add(commentKey(app, file, comment, reply));
+  try { negatives().deny(app, file, comment, reply); }
+  catch (error) {
+    logger.error('[doc-comment-negative] exact veto persistence failed; document withheld', {
+      appId: app, fileToken: file, code: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export function registerDocCommentTurn(
@@ -87,7 +88,7 @@ export function resolveDocCommentTurnCaller(ds: DaemonSession, turnId: string): 
     || record.workerGeneration !== ds.workerGeneration
     || record.workerGeneration !== ds.session.workerGeneration
     || record.cliLifetime !== docCommentCliLifetime(ds)
-    || vetoes.has(commentKey(record.appId, record.fileToken, record.commentId, record.replyId))
+    || negatives().isDenied(record.appId, record.fileToken, record.commentId, record.replyId)
     || target.turnId !== turnId || target.fileToken !== record.fileToken
     || target.fileType !== record.fileType || target.commentId !== record.commentId
     || target.replyId !== record.replyId) return undefined;

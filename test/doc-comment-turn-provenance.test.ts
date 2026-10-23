@@ -3,7 +3,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { registerDocCommentTurn, resolveDocCommentTurnCaller, isDocCommentTurn,
   currentDocCommentHuman, forgetDocCommentTurn, clearDocCommentTurnProvenance,
   docCommentCliLifetime, revokeDocCommentCliLifetime } from '../src/core/doc-comment-turn-provenance.js';
-import { DocCommentVetoLedger } from '../src/core/doc-comment-turn-provenance.js';
+import { vetoDocCommentHuman } from '../src/core/doc-comment-turn-provenance.js';
 import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
 
 function fixture() {
@@ -19,14 +19,14 @@ function fixture() {
 }
 
 describe('daemon-owned exact comment turn provenance', () => {
-  it('bounds negative evidence without reviving pending keys under saturation', () => {
-    const ledger = new DocCommentVetoLedger(4);
-    ledger.add('old-pending');
-    for (let index = 0; index < 10_000; index++) ledger.add(`reply-${index}`);
-    expect(ledger.size).toBeLessThanOrEqual(4);
-    expect(ledger.has('old-pending')).toBe(true);
-    expect(ledger.has('new-untracked')).toBe(true);
-  });
+  it('keeps old legitimate pending and other documents authorized beyond the old saturation threshold', () => {
+    for (let index = 0; index < 5_001; index++) vetoDocCommentHuman('cli_app', 'attacked-file', 'comment', `edit-${index}`);
+    const { ds, record } = fixture();
+    expect(resolveDocCommentTurnCaller(ds, 'reply')?.requestUserOpenId).toBe('ou_author');
+    ds.session.docCommentTargets!.reply.fileToken = 'attacked-file';
+    registerDocCommentTurn(ds, { ...record, fileToken: 'attacked-file' });
+    expect(resolveDocCommentTurnCaller(ds, 'reply')?.requestUserOpenId).toBe('ou_author');
+  }, 180_000);
   it('resolves the admitted author through worker gateway, not destination or stale IM', () => {
     const { ds } = fixture();
     expect(resolveDocCommentTurnCaller(ds, 'reply')).toEqual({ requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_author', senderType: 'user' });

@@ -83,7 +83,7 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    session: { dataDir: '/tmp/test-sessions' },
+    session: { get dataDir() { return process.env.SESSION_DATA_DIR!; }, set dataDir(value: string) { process.env.SESSION_DATA_DIR = value; } },
     daemon: { backendType: 'tmux', cliId: 'claude-code' },
   },
 }));

@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as secureFiles from '../src/platform/secure-host-file.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { registerDocCommentTurn, resolveDocCommentTurnCaller, isDocCommentTurn,
   currentDocCommentHuman, forgetDocCommentTurn, clearDocCommentTurnProvenance,
   docCommentCliLifetime, revokeDocCommentCliLifetime } from '../src/core/doc-comment-turn-provenance.js';
 import { vetoDocCommentHuman } from '../src/core/doc-comment-turn-provenance.js';
 import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, chmodSync: vi.fn(actual.chmodSync) };
+});
 
 function fixture() {
   const target = { fileToken: 'file', fileType: 'docx', commentId: 'comment', replyId: 'reply', turnId: 'reply', replyToOpenId: 'ou_owner' };
@@ -19,6 +26,21 @@ function fixture() {
 }
 
 describe('daemon-owned exact comment turn provenance', () => {
+  it('revokes an in-flight author and fresh testimony after both persistent veto fences fail', async () => {
+    const { ds, record, target } = fixture();
+    target.fileToken = 'double-fault-file'; registerDocCommentTurn(ds, { ...record, fileToken: target.fileToken });
+    expect(currentGatewayCallerOpenId(ds, 'reply')).toBe('ou_author');
+    const awaitingProvider = Promise.resolve().then(() => currentGatewayCallerOpenId(ds, 'reply'));
+    const marker = vi.spyOn(secureFiles, 'writeSecureHostFileSync').mockImplementationOnce(() => { throw new Error('simulated_marker_eroffs'); });
+    vi.mocked(fs.chmodSync).mockImplementationOnce(() => { throw new Error('simulated_fence_eroffs'); });
+    vetoDocCommentHuman('cli_app', target.fileToken, target.commentId, target.replyId);
+    expect(marker).toHaveBeenCalled(); marker.mockRestore();
+    expect(await awaitingProvider).toBeUndefined();
+    expect(currentDocCommentHuman(ds, 'reply')).toBeUndefined();
+    registerDocCommentTurn(ds, { ...record, fileToken: target.fileToken });
+    expect(currentGatewayCallerOpenId(ds, 'reply')).toBeUndefined();
+    const other = fixture(); expect(currentGatewayCallerOpenId(other.ds, 'reply')).toBe('ou_author');
+  });
   it('keeps old legitimate pending and other documents authorized beyond the old saturation threshold', () => {
     for (let index = 0; index < 5_001; index++) vetoDocCommentHuman('cli_app', 'attacked-file', 'comment', `edit-${index}`);
     const { ds, record } = fixture();

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readSecureHostFileSync, writeSecureHostFileSync } from '../platform/secure-host-file.js';
 import { logger } from '../utils/logger.js';
@@ -9,6 +9,14 @@ interface PendingVeto { commentId: string; replyId: string }
 interface FileState { version: 1; appId: string; fileToken: string; pending?: PendingVeto; dbDev?: number; dbIno?: number }
 interface Connection { db: DatabaseSyncLike; dev: number; ino: number }
 
+// Process-wide: closing/recreating a store must not erase a failed write. Only
+// successful writes may retire their temporary guard. A failed document never
+// recovers in this process. Bound exceptional failures, not normal edit traffic;
+// if this working set fills, fail-stop comment personal authorization globally.
+const uncertainDocuments = new Set<string>();
+const MAX_UNCERTAIN_DOCUMENTS = 1024;
+let personalAuthorizationStopped = false;
+
 /** One local DB per app/document isolates capacity/corruption. Disk is O(exact
  * negative entries), not TTL-limited. Only connections are cached; a cache miss
  * always reads persistent authority, never infers an allow from eviction.
@@ -16,6 +24,10 @@ interface Connection { db: DatabaseSyncLike; dev: number; ino: number }
  */
 export class DocCommentNegativeStore {
   private readonly connections = new Map<string, Connection>();
+  private documentGuardKey(appId: string, fileToken: string): string {
+    const root = existsSync(this.dataDir) ? realpathSync(this.dataDir) : resolve(this.dataDir);
+    return createHash('sha256').update(JSON.stringify([root, appId, fileToken])).digest('hex');
+  }
   constructor(private readonly dataDir: string, private readonly maxConnections = 8,
     private readonly openDb = openDatabaseSyncOrThrow) {
     if (!Number.isSafeInteger(maxConnections) || maxConnections < 1) throw new Error('negative_cache_capacity_invalid');
@@ -101,7 +113,19 @@ export class DocCommentNegativeStore {
   }
 
   deny(appId: string, fileToken: string, commentId: string, replyId: string): void {
-    try { this.persistVeto(appId, fileToken, commentId, replyId); }
+    let guard: string;
+    try { guard = this.documentGuardKey(appId, fileToken); }
+    catch (error) { personalAuthorizationStopped = true; throw error; }
+    if (personalAuthorizationStopped || uncertainDocuments.has(guard)) throw new Error('negative_process_quarantine');
+    if (uncertainDocuments.size >= MAX_UNCERTAIN_DOCUMENTS) {
+      personalAuthorizationStopped = true;
+      logger.error('[doc-comment-negative] comment personal authorization fail-stopped; recovery required', { appId, fileToken });
+      throw new Error('negative_process_fail_stop');
+    }
+    // BEFORE any persistence I/O: a failed marker AND failed metadata fence
+    // cannot leave later resolvers reading the old clean authority as an allow.
+    uncertainDocuments.add(guard);
+    try { this.persistVeto(appId, fileToken, commentId, replyId); uncertainDocuments.delete(guard); }
     catch (error) {
       // Even ENOSPC before the pending leaf rename must not leave a clean
       // document readable. A permission fence changes inode metadata without
@@ -140,6 +164,9 @@ export class DocCommentNegativeStore {
 
   isDenied(appId: string, fileToken: string, commentId: string, replyId: string): boolean {
     try {
+      if (personalAuthorizationStopped || uncertainDocuments.has(this.documentGuardKey(appId, fileToken))) {
+        throw new Error('negative_process_quarantine');
+      }
       const state = this.readState(appId, fileToken);
       if (!state) this.initialize(appId, fileToken);
       else if (state.pending) throw new Error('negative_write_pending');

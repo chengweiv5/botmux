@@ -6,7 +6,14 @@ import { DocCommentNegativeStore } from '../src/services/doc-comment-negative-st
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from '../src/services/sqlite-compat.js';
 import { logger } from '../src/utils/logger.js';
 import * as secureFiles from '../src/platform/secure-host-file.js';
+import * as fs from 'node:fs';
 import { putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
+import { spawnSyncTsEvalWithRepoImports, spawnSyncTsScript } from './helpers/ts-runner.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, chmodSync: vi.fn(actual.chmodSync), fsyncSync: vi.fn(actual.fsyncSync) };
+});
 
 const roots: string[] = [];
 const stores: DocCommentNegativeStore[] = [];
@@ -29,6 +36,18 @@ afterEach(() => {
 });
 
 describe('exact persistent comment negatives', () => {
+  it('revokes immediately with real secure-file syscall failures and no durable denial trace', () => {
+    const { root } = fixture();
+    const child = spawnSyncTsScript('test/fixtures/comment-negative-double-fault.ts', [root, 'fail'],
+      { encoding: 'utf8', timeout: 15_000 });
+    expect(child.status).toBe(0);
+    const result = JSON.parse(child.stdout.trim());
+    expect(result.markerFailures).toBeGreaterThan(0);
+    expect(result.fenceFailures).toBeGreaterThan(0);
+    expect(result.unchanged).toBe(true);
+    expect(result.deniedA).toBe(true);
+    expect(result.deniedB).toBe(false);
+  });
   it('keeps every exact veto but allows old unedited pending and new cross-document replies', () => {
     const { store } = fixture();
     store.deny('app', 'A', 'comment', '900'); store.deny('app', 'A', 'comment', '100');
@@ -124,11 +143,21 @@ describe('exact persistent comment negatives', () => {
     expect(store.isDenied('app', 'A', 'c', 'r')).toBe(true);
     expect(store.isDenied('app', 'B', 'c', 'r')).toBe(false);
     fail = false;
-    expect(() => store.deny('app', 'A', 'c', 'later')).toThrow('negative_document_fenced');
+    expect(() => store.deny('app', 'A', 'c', 'later')).toThrow('negative_process_quarantine');
     store.close(); const reopened = new DocCommentNegativeStore(root); stores.push(reopened);
     expect(reopened.isDenied('app', 'A', 'c', 'r')).toBe(true);
     expect(reopened.isDenied('app', 'A', 'c', 'later')).toBe(true);
     expect(reopened.isDenied('app', 'B', 'c', 'r')).toBe(false);
+    // A new OS process has no quarantine memory; the durable directory fence
+    // must still deny the original document while leaving B available.
+    const child = spawnSyncTsEvalWithRepoImports(`
+      import { DocCommentNegativeStore } from './src/services/doc-comment-negative-store.js';
+      const store = new DocCommentNegativeStore(${JSON.stringify(root)});
+      console.log(JSON.stringify({ a: store.isDenied('app','A','c','r'), b: store.isDenied('app','B','c','r') }));
+      store.close();
+    `, { encoding: 'utf8', timeout: 15_000 });
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout.trim())).toEqual({ a: true, b: false });
   });
   it('fences a failed pending-marker write before a previously clean document can be allowed again', () => {
     const { root, store } = fixture();
@@ -140,5 +169,55 @@ describe('exact persistent comment negatives', () => {
     store.close(); const reopened = new DocCommentNegativeStore(root); stores.push(reopened);
     expect(reopened.isDenied('app', 'A', 'c', 'r')).toBe(true);
     expect(reopened.isDenied('app', 'B', 'c', 'r')).toBe(false);
+  });
+  it('withholds a clean document when marker and directory fence both fail, even after store recreation', () => {
+    const { root, store } = fixture();
+    store.initialize('app', 'A'); store.initialize('app', 'B');
+    const cleanState = readFileSync(store.paths('app', 'A').state);
+    vi.spyOn(secureFiles, 'writeSecureHostFileSync').mockImplementationOnce(() => { throw new Error('simulated_readonly_marker'); });
+    const fence = vi.mocked(fs.chmodSync).mockImplementationOnce(() => { throw new Error('simulated_readonly_fence'); });
+    expect(() => store.deny('app', 'A', 'c', 'r')).toThrow('simulated_readonly_marker');
+    expect(fence).toHaveBeenCalled();
+    expect(readFileSync(store.paths('app', 'A').state)).toEqual(cleanState);
+    expect(store.isDenied('app', 'A', 'c', 'r')).toBe(true);
+    expect(store.isDenied('app', 'A', 'c', 'fresh')).toBe(true);
+    expect(store.isDenied('app', 'B', 'c', 'r')).toBe(false);
+    store.close(); const recreated = new DocCommentNegativeStore(root); stores.push(recreated);
+    expect(recreated.isDenied('app', 'A', 'c', 'r')).toBe(true);
+    expect(recreated.isDenied('app', 'B', 'c', 'r')).toBe(false);
+    expect(() => recreated.deny('app', 'A', 'c', 'later')).toThrow();
+    expect(recreated.isDenied('app', 'A', 'c', 'r')).toBe(true);
+  });
+  it('keeps the process guard when the directory fsync also fails', () => {
+    const { root, store } = fixture(); store.initialize('app', 'A'); store.initialize('app', 'B');
+    vi.spyOn(secureFiles, 'writeSecureHostFileSync').mockImplementationOnce(() => { throw new Error('simulated_marker_io'); });
+    vi.mocked(fs.fsyncSync).mockImplementationOnce(() => { throw new Error('simulated_fsync_io'); });
+    expect(() => store.deny('app', 'A', 'c', 'r')).toThrow('simulated_marker_io');
+    // Do not depend on an unconfirmed durability promise from chmod: even if a
+    // host repairs the mode while this process survives, identity stays revoked.
+    chmodSync(join(store.paths('app', 'A').state, '..'), 0o700);
+    expect(store.isDenied('app', 'A', 'c', 'r')).toBe(true);
+    store.close(); const recreated = new DocCommentNegativeStore(root); stores.push(recreated);
+    expect(recreated.isDenied('app', 'A', 'c', 'new')).toBe(true);
+    expect(recreated.isDenied('app', 'B', 'c', 'r')).toBe(false);
+  });
+  it('fail-stops personal comment authority if exceptional document quarantine capacity is exhausted', () => {
+    const { root } = fixture();
+    const child = spawnSyncTsEvalWithRepoImports(`
+      import { DocCommentNegativeStore } from './src/services/doc-comment-negative-store.js';
+      import { logger } from './src/utils/logger.js';
+      import { writeFileSync } from 'node:fs';
+      logger.error = () => {};
+      const root = ${JSON.stringify(root)};
+      const healthy = new DocCommentNegativeStore(root);
+      const before = healthy.isDenied('app', 'healthy', 'c', 'r');
+      const brokenRoot = root + '/not-a-directory'; writeFileSync(brokenRoot, 'file');
+      const broken = new DocCommentNegativeStore(brokenRoot);
+      for (let i = 0; i < 1100; i++) { try { broken.deny('app', String(i), 'c', 'r'); } catch {} }
+      console.log(JSON.stringify({ before, after: healthy.isDenied('app', 'healthy', 'c', 'r') }));
+      healthy.close(); broken.close();
+    `, { encoding: 'utf8', timeout: 15_000 });
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout.trim())).toEqual({ before: false, after: true });
   });
 });

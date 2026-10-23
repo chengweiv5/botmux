@@ -2,7 +2,8 @@
 import { readSecureHostFileSync } from '../src/platform/secure-host-file.js';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { DocCommentNegativeStore, type DocCommentRecoveryEvidence } from '../src/services/doc-comment-negative-store.js';
+import { DocCommentNegativeStore } from '../src/services/doc-comment-negative-store.js';
+import type { SignedCommentRecovery } from '../src/services/doc-comment-recovery-trust.js';
 
 const [dataDir, evidenceFile, confirm] = process.argv.slice(2);
 if (!dataDir || !evidenceFile || confirm !== '--confirm-offline-audited') {
@@ -21,5 +22,5 @@ for (const name of readdirSync(root).filter(n => /^daemon(?:-\d+)?\.pid$/.test(n
 const raw = readSecureHostFileSync(resolve(evidenceFile), 16 * 1024 * 1024);
 if (!raw) throw new Error('negative_recovery_evidence_missing');
 const store = new DocCommentNegativeStore(root);
-try { store.recoverOffline(JSON.parse(raw) as DocCommentRecoveryEvidence); console.log('Offline evidence recorded; only a future daemon may claim a new uncertain epoch.'); }
+try { store.recoverOffline(JSON.parse(raw) as SignedCommentRecovery); console.log('Offline signed evidence recorded; only a future daemon may claim a new uncertain epoch.'); }
 finally { store.close(); }

@@ -60,8 +60,9 @@ function setup(name: string, opts: { recordTurns: boolean; history?: object[] })
   root = mkdtempSync(join(tmpdir(), `botmux-${name}-`));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir, { recursive: true });
+  const workDir = join(root, 'work'); mkdirSync(workDir);
   const cliSessionId = 'deadbeef-1234-4678-9abc-def012345680';
-  const sessionsDir = join(root, '.pi', 'agent', 'sessions', dataDir.replace(/\//g, '--'));
+  const sessionsDir = join(root, '.pi', 'agent', 'sessions', workDir.replace(/\//g, '--'));
   mkdirSync(sessionsDir, { recursive: true });
   const transcript = join(sessionsDir, `20261020_${cliSessionId}.jsonl`);
   writeFileSync(transcript, (opts.history ?? []).map(message => JSON.stringify({
@@ -130,7 +131,7 @@ function startWorker(env: ReturnType<typeof setup>, init: Partial<Extract<Daemon
   child.stderr?.on('data', chunk => logs.push(chunk.toString()));
   child.send({
     type: 'init', sessionId: env.sid, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: env.dataDir, cliId: 'pi', cliPathOverride: env.fakePi, cliSessionId: env.cliSessionId,
+    workingDir: join(root!, 'work'), cliId: 'pi', cliPathOverride: env.fakePi, cliSessionId: env.cliSessionId,
     backendType: 'pty', prompt: '', larkAppId: 'app_test', larkAppSecret: 'test-only', locale: 'zh', ...init,
   } satisfies DaemonToWorker);
   const notices = () => messages.filter((msg): msg is Extract<WorkerToDaemon, { type: 'user_notify' }> => msg.type === 'user_notify');

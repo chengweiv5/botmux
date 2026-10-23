@@ -26,6 +26,8 @@
  * filtering, sibling-free by design) and passes canonical absolute paths.
  */
 
+import { docCommentHostOnlyPaths } from '../../core/doc-comment-host-boundary.js';
+
 export type FsAccess = 'readWrite' | 'readOnly' | 'deny';
 export type FsRuleSource = 'baseline' | 'adapter' | 'internal' | 'user' | 'mandatory';
 
@@ -58,6 +60,8 @@ export interface FsPolicy {
    *  host-only root. Unlike ordinary mandatory denies, these roots permit no
    *  deeper carve-out: a sandbox must never read or mutate their contents. */
   suppressedHostOnlyPaths?: string[];
+  /** Reasserted after Seatbelt regex/final carve-outs; no config can reopen. */
+  finalHostOnlyDenyPaths?: string[];
 }
 
 export interface FsPolicyUserPaths {
@@ -647,6 +651,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
   const hostOnlyRoots = [
     `${ctx.sessionDataDir}/link-refs`,
+    ...docCommentHostOnlyPaths(ctx.sessionDataDir),
     ...(ctx.hostOnlyDenyPaths ?? []),
   ]
     .map(normalizeFsPath)
@@ -1104,9 +1109,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   return {
     rules,
+    finalHostOnlyDenyPaths: hostOnlyRoots,
     net: ctx.net !== false,
     writeRegexes: [...(ctx.writeRegexes ?? [])],
-    denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
+    denyRegexes: [...(ctx.mandatoryDenyRegexes ?? []),
+      `^${ctx.sessionDataDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/daemon(?:-[0-9]+)?\\.pid$`],
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
@@ -1219,6 +1226,10 @@ export function compileToSeatbelt(policy: FsPolicy): string {
   }
   for (const path of policy.finalReadOnlyPaths ?? []) {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
+  }
+  for (const path of policy.finalHostOnlyDenyPaths ?? []) {
+    lines.push(`(deny file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
   return lines.join('\n') + '\n';

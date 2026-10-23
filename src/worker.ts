@@ -22,7 +22,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, clearAllSessionIdentities, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
@@ -60,6 +60,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
+import { docCommentHostOnlyPaths, assertDocCommentHostStorageOutsideWritableRoots } from './core/doc-comment-host-boundary.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -19329,6 +19330,11 @@ async function spawnCli(
   if (effectiveNetworkError) throw new Error(effectiveNetworkError);
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
+  const boundaryPath = (p: string) => { try { return realpathSync(p); } catch { return resolve(p); } };
+  if (!remoteBackendFullyOffBox) assertDocCommentHostStorageOutsideWritableRoots(
+    boundaryPath(isolationRuntimeDataDir),
+    [cfg.workingDir, ...(cfg.sandboxPaths?.readWrite ?? [])].map(boundaryPath), sandboxRequested,
+  );
   if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
     throw new Error('sandbox "scratch" is supported only on Linux (full-root COW overlay) and macOS (APFS clonefile); use "oncall" or turn the sandbox off');
   }
@@ -21486,6 +21492,8 @@ async function spawnCli(
     const hostOnlyDenyPaths: string[] = [
       join(canonical(dataDir), 'schedule-preconditions'),
       join(canonical(dataDir), 'link-refs'),
+      ...docCommentHostOnlyPaths(canonical(dataDir)).map(canonical),
+      ...readdirSync(dataDir).filter(name => /^daemon(?:-\d+)?\.pid$/.test(name)).map(name => join(canonical(dataDir), name)),
     ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
@@ -21975,6 +21983,7 @@ async function spawnCli(
       sessionId: cfg.sessionId,
     });
     const scratchDeny = [...new Set<string>([
+      ...docCommentHostOnlyPaths(scratchCanonical(scratchDataDir)).map(scratchCanonical),
       ...credentialRules.denyPaths.map(scratchCanonical),
       ...scratchSecrets.denyPaths,
       join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
@@ -22423,7 +22432,7 @@ async function spawnCli(
     );
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      [...rules.denyPaths.map(canonical), canonical(profileDir)],
+      [...rules.denyPaths.map(canonical), ...docCommentHostOnlyPaths(canonical(isolationRuntimeDataDir)), canonical(profileDir)],
       [canonical(originDirectory), canonical(attestationDirectory)],
       [],
       [canonical(profileDir)],
@@ -22432,6 +22441,7 @@ async function spawnCli(
       {
         denyWritePaths: [...new Set([
           ...rules.denyWritePaths.map(canonical),
+          ...docCommentHostOnlyPaths(canonical(isolationRuntimeDataDir)),
           canonical(profileDir),
         ])],
         denyWriteRegexes: rules.denyWriteRegexes,
@@ -22456,6 +22466,14 @@ async function spawnCli(
     mkdirSync(panePolicyDir, { recursive: true });
     const hideDirectories = new Set<string>();
     const hideFiles = new Set<string>();
+    for (const path of docCommentHostOnlyPaths(isolationRuntimeDataDir)) {
+      if (!existsSync(path)) continue;
+      if (statSync(path).isDirectory()) hideDirectories.add(realpathSync(path));
+      else hideFiles.add(realpathSync(path));
+    }
+    for (const name of readdirSync(isolationRuntimeDataDir)) {
+      if (/^daemon(?:-\d+)?\.pid$/.test(name)) hideFiles.add(join(isolationRuntimeDataDir, name));
+    }
     const processedRoots = new Set<string>();
     const isDashboardAuthorityBasename = (name: string): boolean =>
       name === '.dashboard-secret'

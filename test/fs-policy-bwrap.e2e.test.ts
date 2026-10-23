@@ -54,7 +54,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
   // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
   // empty sources, missing mountpoints pre-created). Returns the created-mask
   // list too so cleanup tests can assert rmdir-if-empty.
-  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string; mandatoryReadOnlyPaths?: string[]; sessionOwnedReadonlyRoots?: string[] } = {}) {
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string; mandatoryReadOnlyPaths?: string[]; sessionOwnedReadonlyRoots?: string[]; sessionDataDir?: string; extraWritePaths?: string[] } = {}) {
     const emptiesDir = join(S, 'sbx/empties');
     const emptyDir = join(S, 'sbx/empty');
     mkdirSync(emptiesDir, { recursive: true });
@@ -62,7 +62,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
 
     const policy = buildFsPolicy({
       platform: 'linux', homeDir: canonical(homedir()),
-      botmuxHome: join(S, 'botmux-home'), sessionDataDir: join(S, 'botmux-home/data'),
+      botmuxHome: join(S, 'botmux-home'), sessionDataDir: opts.sessionDataDir ?? join(S, 'botmux-home/data'),
       sessionId: 'e2e-session',
       workingDir: join(S, 'proj'), currentAppId: 'cli_e2e', botHome: opts.botHome ?? join(S, 'botmux-home/bots/cli_e2e'),
       redirectedCliData: true,
@@ -72,6 +72,7 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
       larkTransportEnabled: opts.larkTransportEnabled,
       mandatoryReadOnlyPaths: opts.mandatoryReadOnlyPaths,
       sessionOwnedReadonlyRoots: opts.sessionOwnedReadonlyRoots,
+      extraWritePaths: opts.extraWritePaths,
       net: true, writeRegexes: [],
     });
     policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
@@ -87,7 +88,13 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     }
     const compiled = compileToBwrap(policy, { symlinks, emptyDir, emptiesDir, filePaths, chdir: join(S, 'proj') });
     chmodSync(emptyDir, 0o000);
-    for (const f of compiled.emptyFiles) writeFileSync(f.path, '', { mode: 0o000 });
+    for (const f of compiled.emptyFiles) {
+      // A prior case may have created the same deterministic mask basename as
+      // 000. Reusing this disposable fixture must not require reading/writing
+      // that old inode (the production compiler prepares a new session tree).
+      if (existsSync(f.path)) chmodSync(f.path, 0o600);
+      writeFileSync(f.path, '', { mode: 0o000 }); chmodSync(f.path, 0o000);
+    }
     // Mirror the worker: pre-create missing mask mountpoints (leaf + ancestors).
     const created: { path: string; kind: 'dir' | 'file' }[] = [];
     for (const m of compiled.maskMounts) {
@@ -125,6 +132,18 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     const { args } = build({});
     expect(run(args, `cat ${JSON.stringify(join(S, 'proj/readme.md'))}`).status).toBe(0);
     expect(run(args, `echo hi > ${JSON.stringify(join(S, 'proj/work/new.txt'))}`).status).toBe(0);
+  });
+  it('masks comment authority and audit despite nested project/user/internal write grants',()=>{
+    const data=join(S,'proj/data');const root=join(data,'doc-comment-negative');
+    mkdirSync(join(root,'document'),{recursive:true});writeFileSync(join(root,'document/state.json'),'HOST-NEGATIVE');
+    writeFileSync(join(data,'daemon.pid'),'12345');
+    const {args}=build({readWrite:[data,join(root,'document')]},{sessionDataDir:data,extraWritePaths:[join(root,'document')]});
+    expect(run(args,`cat ${JSON.stringify(join(root,'document/state.json'))}`).out).not.toContain('HOST-NEGATIVE');
+    expect(run(args,`printf forged > ${JSON.stringify(join(root,'document/state.json'))}`).status).not.toBe(0);
+    expect(run(args,`rm ${JSON.stringify(join(data,'daemon.pid'))}`).status).not.toBe(0);
+    expect(readFileSync(join(root,'document/state.json'),'utf8')).toBe('HOST-NEGATIVE');
+    expect(readFileSync(join(data,'daemon.pid'),'utf8')).toBe('12345');
+    expect(run(args,`printf safe > ${JSON.stringify(join(S,'proj/work/comment-safe'))}`).status).toBe(0);
   });
 
   it('readOnly: reads but cannot write', () => {

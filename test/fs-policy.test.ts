@@ -113,6 +113,16 @@ describe('mergeFsRules + accessForPath (the policy semantics)', () => {
 });
 
 describe('buildFsPolicy', () => {
+  it.each(['darwin','linux'] as const)('keeps the entire comment authority tree host-only under project and user allows on %s',platform=>{
+    const data='/home/u/project/data';const root=`${data}/doc-comment-negative`;
+    const policy=buildFsPolicy(ctx({platform,workingDir:'/home/u/project',sessionDataDir:data,
+      userPaths:{readWrite:[data,`${root}/audit`,`${root}/x/state.json`,`${data}/daemon.pid`]},
+      extraWritePaths:[`${root}/internal`],mandatoryReadOnlyPaths:[`${root}/read`]}));
+    for(const path of [`${root}/x/state.json`,`${root}/x/negative.sqlite-wal`,`${root}/x/recovery-proof.json`,`${root}/audit/input.json`,`${root}/internal/file`,`${data}/daemon.pid`]){
+      expect(accessForPath(policy.rules,path).access).toBe('deny');
+    }
+    expect(accessForPath(policy.rules,'/home/u/project/source.ts').access).toBe('readWrite');
+  });
   it.each(['darwin', 'linux'] as const)('keeps the LinkRef ledger host-only on %s', (platform) => {
     const homeDir = platform === 'darwin' ? '/Users/u' : '/home/u';
     const botmuxHome = `${homeDir}/.botmux`;

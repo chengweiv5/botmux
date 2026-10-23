@@ -5,6 +5,7 @@ import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.
 import { readSecureHostFileSync, writeSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { logger } from '../utils/logger.js';
+import { readVerifiedCommentRecovery, type SignedCommentRecovery } from './doc-comment-recovery-trust.js';
 
 interface PendingVeto { commentId: string; replyId: string }
 interface Epoch { id: string; pid: number; identity: string }
@@ -89,6 +90,10 @@ export class DocCommentNegativeStore {
         if (!fresh?.recovery || fresh.recovery.issuedAt >= runtimeStartedAt) return;
         const audit = readSecureHostFileSync(join(paths.state, '..', `recovery-${fresh.recovery.auditDigest}.json`), 16 * 1024 * 1024);
         if (!audit || createHash('sha256').update(audit).digest('hex') !== fresh.recovery.auditDigest) throw new Error('negative_recovery_audit_missing');
+        const evidence = JSON.parse(readVerifiedCommentRecovery(JSON.parse(audit) as SignedCommentRecovery)) as DocCommentRecoveryEvidence;
+        if (evidence.appId !== appId || evidence.fileToken !== fileToken
+          || evidence.previousEpochId !== fresh.uncertain?.id || evidence.authoritativeHistoryComplete !== true
+          || evidence.ingressStoppedAndDrained !== true) throw new Error('negative_recovery_signed_scope_mismatch');
         this.connection(appId, fileToken);
         const next = { ...fresh, uncertain: processEpoch, recovery: undefined };
         host.writeLeaf(JSON.stringify(next));
@@ -290,7 +295,8 @@ export class DocCommentNegativeStore {
   /** Host OFFLINE management only. Evidence is an explicit operator attestation
    * of audited authoritative history, never a CLI/IM identity proof. Cannot run
    * alongside the original epoch holder, clear negatives, or grant a caller. */
-  recoverOffline(evidence: DocCommentRecoveryEvidence): void {
+  recoverOffline(signed: SignedCommentRecovery): void {
+    const evidence = JSON.parse(readVerifiedCommentRecovery(signed)) as DocCommentRecoveryEvidence;
     const { appId, fileToken } = evidence;
     if (evidence.version !== 1 || !appId || !fileToken || !evidence.previousEpochId
       || evidence.ingressStoppedAndDrained !== true || evidence.authoritativeHistoryComplete !== true
@@ -325,9 +331,10 @@ export class DocCommentNegativeStore {
       chmodSync(dir, 0o700);
       const fd = openSync(dir, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
       const db = this.connection(appId, fileToken);
-      const digest = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+      const audit = JSON.stringify(signed);
+      const digest = createHash('sha256').update(audit).digest('hex');
       // Preserve evidence/audit durably before changing the handoff state.
-      writeSecureHostFileSync(join(paths.state, '..', `recovery-${digest}.json`), JSON.stringify(evidence));
+      writeSecureHostFileSync(join(paths.state, '..', `recovery-${digest}.json`), audit);
       db.exec('BEGIN IMMEDIATE;');
       try {
         for (const negative of evidence.negatives) db.prepare('INSERT OR IGNORE INTO veto VALUES (?, ?)').run(negative.commentId, negative.replyId);

@@ -780,7 +780,7 @@ import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription,
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, getDocComment, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { pruneOldAttachments, collectProtectedAttachmentDirs } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, resolveName, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
-import { registerDocCommentTurn, isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn, vetoDocCommentHuman, docCommentCliLifetime } from './core/doc-comment-turn-provenance.js';
+import { registerDocCommentTurn, isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn, vetoDocCommentHuman, docCommentCliLifetime, docCommentPersonalAuthorityAvailable, prepareDocCommentPersonalIngress, prepareStoredDocCommentPersonalIngress } from './core/doc-comment-turn-provenance.js';
 import { clearAllSessionIdentities } from './core/cli-identity.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
@@ -28945,6 +28945,9 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
       ensureCurrentRoutingGeneration(generation, 'comment:human-provenance');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
+      if (humanAuthor && !docCommentPersonalAuthorityAvailable(larkAppId, sub.fileToken, commentId, userReplyId ?? '')) {
+        humanAuthor = undefined;
+      }
       const bindCommentHuman = (workerGeneration: number): void => {
         registerDocCommentTurn(ds!, { fileToken: sub.fileToken, fileType: sub.fileType,
           commentId, replyId: userReplyId ?? '', turnId, workerGeneration, cliLifetime, authorOpenId: humanAuthor });
@@ -31567,6 +31570,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   // Normalize legacy document-native watches before restore can close their old sessions.
   if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
+  prepareStoredDocCommentPersonalIngress(cfg.larkAppId);
+  // Claim offline handoff before restored workers or IPC/WS/poll can authorize.
+  for (const sub of listAllDocSubscriptions(config.session.dataDir, cfg.larkAppId)) {
+    prepareDocCommentPersonalIngress(cfg.larkAppId, sub.fileToken);
+  }
 
   // Restore active sessions from previous run
   const startupXpiQuarantineNotices = await restoreSessionsAndScheduleStartupRecovery({

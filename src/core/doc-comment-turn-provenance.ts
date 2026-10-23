@@ -58,6 +58,19 @@ export function vetoDocCommentHuman(app: string, file: string, comment: string, 
   }
 }
 
+/** Also gate refork's early trigger-user publication before worker reservation. */
+export function docCommentPersonalAuthorityAvailable(app: string, file: string, comment: string, reply: string): boolean {
+  return !negatives().isDenied(app, file, comment, reply);
+}
+
+export function prepareDocCommentPersonalIngress(app: string, file: string): void {
+  negatives().prepareIngress(app, file);
+}
+
+export function prepareStoredDocCommentPersonalIngress(app: string): void {
+  negatives().prepareStoredIngress(app);
+}
+
 export function registerDocCommentTurn(
   ds: DaemonSession,
   input: Omit<CommentTurnRecord, 'session' | 'appId' | 'sessionId' | 'cliLifetime'> & { cliLifetime?: number },

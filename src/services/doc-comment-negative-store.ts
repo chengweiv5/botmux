@@ -1,13 +1,22 @@
-import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
-import { readSecureHostFileSync, writeSecureHostFileSync } from '../platform/secure-host-file.js';
+import { readSecureHostFileSync, writeSecureHostFileSync, withSecureHostParentSync } from '../platform/secure-host-file.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { logger } from '../utils/logger.js';
 
 interface PendingVeto { commentId: string; replyId: string }
-interface FileState { version: 1; appId: string; fileToken: string; pending?: PendingVeto; dbDev?: number; dbIno?: number }
+interface Epoch { id: string; pid: number; identity: string }
+interface FileState { version: 1; appId: string; fileToken: string; pending?: PendingVeto; dbDev?: number; dbIno?: number;
+  uncertain?: Epoch; recovery?: { id: string; issuedAt: number; auditDigest: string } }
 interface Connection { db: DatabaseSyncLike; dev: number; ino: number }
+
+export interface DocCommentRecoveryEvidence {
+  version: 1; appId: string; fileToken: string; previousEpochId: string;
+  ingressStoppedAndDrained: true; authoritativeHistoryComplete: true;
+  evidenceReference: string; operator: string; negatives: PendingVeto[];
+}
 
 // Process-wide: closing/recreating a store must not erase a failed write. Only
 // successful writes may retire their temporary guard. A failed document never
@@ -16,6 +25,8 @@ interface Connection { db: DatabaseSyncLike; dev: number; ino: number }
 const uncertainDocuments = new Set<string>();
 const MAX_UNCERTAIN_DOCUMENTS = 1024;
 let personalAuthorizationStopped = false;
+const runtimeStartedAt = Date.now();
+const processEpoch: Epoch = { id: randomUUID(), pid: process.pid, identity: readDurableProcessIdentity(process.pid) ?? '' };
 
 /** One local DB per app/document isolates capacity/corruption. Disk is O(exact
  * negative entries), not TTL-limited. Only connections are cached; a cache miss
@@ -39,16 +50,85 @@ export class DocCommentNegativeStore {
     return { state: join(dir, 'state.json'), db: join(dir, 'negative.sqlite') };
   }
 
-  private readState(appId: string, fileToken: string): FileState | null {
+  private readState(appId: string, fileToken: string, allowFenced = false): FileState | null {
     const dir = join(this.paths(appId, fileToken).state, '..');
-    if (existsSync(dir) && (lstatSync(dir).mode & 0o777) !== 0o700) throw new Error('negative_document_fenced');
+    if (existsSync(dir) && (lstatSync(dir).mode & 0o777) !== 0o700
+      && !(allowFenced && (lstatSync(dir).mode & 0o777) === 0o500)) throw new Error('negative_document_fenced');
     const raw = readSecureHostFileSync(this.paths(appId, fileToken).state, 16_384);
     if (raw === null) return null;
     const state = JSON.parse(raw) as FileState;
     if (state.version !== 1 || state.appId !== appId || state.fileToken !== fileToken
       || state.pending && (typeof state.pending.commentId !== 'string' || !state.pending.commentId
         || typeof state.pending.replyId !== 'string' || !state.pending.replyId)) throw new Error('negative_state_invalid');
+    if (state.uncertain && (typeof state.uncertain.id !== 'string' || !state.uncertain.id
+      || !Number.isSafeInteger(state.uncertain.pid) || state.uncertain.pid <= 1
+      || typeof state.uncertain.identity !== 'string' || !state.uncertain.identity)) throw new Error('negative_epoch_invalid');
+    if (state.recovery && (!state.uncertain || typeof state.recovery.id !== 'string'
+      || !Number.isSafeInteger(state.recovery.issuedAt) || typeof state.recovery.auditDigest !== 'string')) throw new Error('negative_recovery_invalid');
     return state;
+  }
+
+  private assertPersonalEpoch(appId: string, fileToken: string): void {
+    if (!processEpoch.identity) throw new Error('negative_process_identity_unavailable');
+    let state = this.readState(appId, fileToken);
+    if (!state) { this.initialize(appId, fileToken); state = this.readState(appId, fileToken); }
+    if (!state?.uncertain || state.uncertain.id !== processEpoch.id
+      || state.uncertain.pid !== processEpoch.pid || state.uncertain.identity !== processEpoch.identity
+      || state.pending || state.recovery) throw new Error('negative_epoch_recovery_required');
+  }
+
+  private claimRecoveredEpoch(appId: string, fileToken: string): void {
+    const paths = this.paths(appId, fileToken);
+    const state = this.readState(appId, fileToken);
+    if (state?.recovery && state.recovery.issuedAt < runtimeStartedAt) {
+      // Only an explicit offline recovery can issue this single-use handoff.
+      // Claim and replace with durable uncertain BEFORE any allow. A running
+      // process predating recovery cannot silently pick it up.
+      withSecureHostParentSync(paths.state, host => host.withLeafLock(() => {
+        const fresh = this.readState(appId, fileToken);
+        if (!fresh?.recovery || fresh.recovery.issuedAt >= runtimeStartedAt) return;
+        const audit = readSecureHostFileSync(join(paths.state, '..', `recovery-${fresh.recovery.auditDigest}.json`), 16 * 1024 * 1024);
+        if (!audit || createHash('sha256').update(audit).digest('hex') !== fresh.recovery.auditDigest) throw new Error('negative_recovery_audit_missing');
+        this.connection(appId, fileToken);
+        const next = { ...fresh, uncertain: processEpoch, recovery: undefined };
+        host.writeLeaf(JSON.stringify(next));
+      }));
+    }
+    this.assertPersonalEpoch(appId, fileToken);
+  }
+
+  /** Must run before enabling comment ingress after an offline handoff. A
+   * failed durable claim aborts ingress startup; otherwise a failed veto could
+   * leave the old unused recovery permit claimable by a later process. */
+  prepareIngress(appId: string, fileToken: string): void {
+    let state: FileState | null;
+    try { state = this.readState(appId, fileToken, true); }
+    catch { return; /* invalid ordinary documents remain anonymous in resolver */ }
+    try {
+      if (!state) this.initialize(appId, fileToken);
+      else if (state.recovery) this.claimRecoveredEpoch(appId, fileToken);
+    } catch (error) {
+      this.quarantine(appId, fileToken);
+      if (state?.recovery) throw error; // no ingress after unclaimed recovery
+      logger.error('[doc-comment-negative] initial epoch unavailable; document anonymous', { appId, fileToken });
+    }
+  }
+
+  /** Include retired/unsubscribed documents: an unused offline handoff must
+   * not outlive ingress that can later re-subscribe the same file. */
+  prepareStoredIngress(appId: string): void {
+    const root = join(this.dataDir, 'doc-comment-negative');
+    if (!existsSync(root)) return;
+    for (const dir of readdirSync(root)) {
+      if (!/^[a-f0-9]{64}$/.test(dir)) continue;
+      let state: FileState;
+      try {
+        const raw = readSecureHostFileSync(join(root, dir, 'state.json'), 16_384);
+        if (!raw) continue; // missing state cannot mint authority
+        state = JSON.parse(raw) as FileState;
+      } catch { continue; /* corrupt documents cannot authorize in resolver */ }
+      if (state.appId === appId) this.prepareIngress(appId, state.fileToken);
+    }
   }
 
   private connection(appId: string, fileToken: string): DatabaseSyncLike {
@@ -86,6 +166,19 @@ export class DocCommentNegativeStore {
    * or deleted/corrupt DB into a fresh empty authority.
    */
   initialize(appId: string, fileToken: string): void {
+    try { this.initializeDurable(appId, fileToken); }
+    catch (error) { this.quarantine(appId, fileToken); throw error; }
+  }
+
+  private quarantine(appId: string, fileToken: string): void {
+    try {
+      if (uncertainDocuments.size >= MAX_UNCERTAIN_DOCUMENTS) personalAuthorizationStopped = true;
+      else uncertainDocuments.add(this.documentGuardKey(appId, fileToken));
+    } catch { personalAuthorizationStopped = true; }
+  }
+
+  private initializeDurable(appId: string, fileToken: string): void {
+    if (!processEpoch.identity) throw new Error('negative_process_identity_unavailable');
     const paths = this.paths(appId, fileToken);
     const state = this.readState(appId, fileToken);
     if (state) {
@@ -109,7 +202,15 @@ export class DocCommentNegativeStore {
       db.exec('COMMIT;');
     } finally { db.close(); }
     const stats = lstatSync(paths.db);
-    writeSecureHostFileSync(paths.state, JSON.stringify({ version: 1, appId, fileToken, dbDev: stats.dev, dbIno: stats.ino }));
+    // There is NO clean epoch. Persist before the first personal allow and
+    // retain through normal exit/crash/deny writes. A new OS process is anonymous.
+    writeSecureHostFileSync(paths.state, JSON.stringify({ version: 1, appId, fileToken,
+      dbDev: stats.dev, dbIno: stats.ino, uncertain: processEpoch }));
+    // atomic leaf fsync is insufficient for a newly-created document/root
+    // directory: persist their entries too before allowing personal authority.
+    for (const dir of [join(paths.state, '..'), join(this.dataDir, 'doc-comment-negative'), this.dataDir]) {
+      const fd = openSync(dir, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
+    }
   }
 
   deny(appId: string, fileToken: string, commentId: string, replyId: string): void {
@@ -170,8 +271,12 @@ export class DocCommentNegativeStore {
       const state = this.readState(appId, fileToken);
       if (!state) this.initialize(appId, fileToken);
       else if (state.pending) throw new Error('negative_write_pending');
+      this.assertPersonalEpoch(appId, fileToken);
       return !!this.connection(appId, fileToken).prepare('SELECT 1 FROM veto WHERE comment_id=? AND reply_id=?').get(commentId, replyId);
     } catch (error) {
+      // An epoch write whose fsync failed must not be trusted on a retry just
+      // because its bytes became visible in the page cache.
+      if ((error as Error).message !== 'negative_epoch_recovery_required') this.quarantine(appId, fileToken);
       logger.error('[doc-comment-negative] document personal authorization withheld', {
         appId, fileToken, code: error instanceof Error ? error.message : String(error),
       });
@@ -181,4 +286,55 @@ export class DocCommentNegativeStore {
 
   get cachedConnections(): number { return this.connections.size; }
   close(): void { for (const entry of this.connections.values()) entry.db.close(); this.connections.clear(); }
+
+  /** Host OFFLINE management only. Evidence is an explicit operator attestation
+   * of audited authoritative history, never a CLI/IM identity proof. Cannot run
+   * alongside the original epoch holder, clear negatives, or grant a caller. */
+  recoverOffline(evidence: DocCommentRecoveryEvidence): void {
+    const { appId, fileToken } = evidence;
+    if (evidence.version !== 1 || !appId || !fileToken || !evidence.previousEpochId
+      || evidence.ingressStoppedAndDrained !== true || evidence.authoritativeHistoryComplete !== true
+      || !evidence.evidenceReference?.trim() || !evidence.operator?.trim() || !Array.isArray(evidence.negatives)
+      || evidence.negatives.some(n => !n || typeof n.commentId !== 'string' || !n.commentId
+        || typeof n.replyId !== 'string' || !n.replyId)) throw new Error('negative_recovery_evidence_required');
+    const paths = this.paths(appId, fileToken);
+    // A 0500 failed document cannot create a lock leaf. Validate the audited
+    // offline transition BEFORE lifting that fence; uncertain remains durable.
+    const before = this.readState(appId, fileToken, true);
+    if (!before?.uncertain || before.uncertain.id !== evidence.previousEpochId || before.recovery) throw new Error('negative_recovery_epoch_mismatch');
+    try { process.kill(before.uncertain.pid, 0); throw new Error('negative_recovery_holder_live_or_unverified'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    if (before.pending && !evidence.negatives.some(n => n.commentId === before.pending!.commentId && n.replyId === before.pending!.replyId)) throw new Error('negative_recovery_pending_not_accounted');
+    chmodSync(join(paths.state, '..'), 0o700);
+    const directoryFd = openSync(join(paths.state, '..'), 'r');
+    try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+    withSecureHostParentSync(paths.state, host => host.withLeafLock(() => {
+      const state = this.readState(appId, fileToken, true);
+      if (!state?.uncertain || state.uncertain.id !== evidence.previousEpochId || state.recovery) throw new Error('negative_recovery_epoch_mismatch');
+      // kill(0) is conservative: PID reuse/permission uncertainty also refuses.
+      let dead = false;
+      try { process.kill(state.uncertain.pid, 0); }
+      catch (error) { dead = (error as NodeJS.ErrnoException).code === 'ESRCH'; }
+      if (!dead) throw new Error('negative_recovery_holder_live_or_unverified');
+      if (state.pending && !evidence.negatives.some(n => n.commentId === state.pending!.commentId && n.replyId === state.pending!.replyId)) {
+        throw new Error('negative_recovery_pending_not_accounted');
+      }
+      // Only after offline audited evidence validation; uncertain is retained
+      // while lifting the filesystem fence and through every failure below.
+      const dir = join(paths.state, '..');
+      chmodSync(dir, 0o700);
+      const fd = openSync(dir, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
+      const db = this.connection(appId, fileToken);
+      const digest = createHash('sha256').update(JSON.stringify(evidence)).digest('hex');
+      // Preserve evidence/audit durably before changing the handoff state.
+      writeSecureHostFileSync(join(paths.state, '..', `recovery-${digest}.json`), JSON.stringify(evidence));
+      db.exec('BEGIN IMMEDIATE;');
+      try {
+        for (const negative of evidence.negatives) db.prepare('INSERT OR IGNORE INTO veto VALUES (?, ?)').run(negative.commentId, negative.replyId);
+        db.exec('COMMIT;');
+      } catch (error) { try { db.exec('ROLLBACK;'); } catch {} throw error; }
+      host.writeLeaf(JSON.stringify({ ...state, pending: undefined,
+        recovery: { id: randomUUID(), issuedAt: Date.now(), auditDigest: digest } }));
+    }));
+  }
 }

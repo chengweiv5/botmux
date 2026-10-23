@@ -47,6 +47,10 @@ describe('exact persistent comment negatives', () => {
     expect(result.unchanged).toBe(true);
     expect(result.deniedA).toBe(true);
     expect(result.deniedB).toBe(false);
+    const restarted = spawnSyncTsScript('test/fixtures/comment-negative-double-fault.ts', [root, 'reopen'],
+      { encoding: 'utf8', timeout: 15_000 });
+    expect(restarted.status).toBe(0);
+    expect(JSON.parse(restarted.stdout.trim()).deniedA).toBe(true);
   });
   it('keeps every exact veto but allows old unedited pending and new cross-document replies', () => {
     const { store } = fixture();
@@ -157,7 +161,9 @@ describe('exact persistent comment negatives', () => {
       store.close();
     `, { encoding: 'utf8', timeout: 15_000 });
     expect(child.status).toBe(0);
-    expect(JSON.parse(child.stdout.trim())).toEqual({ a: true, b: false });
+    // Both documents were authorized in the prior epoch. Normal shutdown also
+    // retains uncertain, so B is anonymous after an actual process restart.
+    expect(JSON.parse(child.stdout.trim())).toEqual({ a: true, b: true });
   });
   it('fences a failed pending-marker write before a previously clean document can be allowed again', () => {
     const { root, store } = fixture();
@@ -219,5 +225,131 @@ describe('exact persistent comment negatives', () => {
     `, { encoding: 'utf8', timeout: 15_000 });
     expect(child.status).toBe(0);
     expect(JSON.parse(child.stdout.trim())).toEqual({ before: false, after: true });
+  });
+  it('retains uncertain on clean exit and keeps old legitimate pending anonymous until audited recovery', () => {
+    const { root } = fixture();
+    const prior = spawnSyncTsEvalWithRepoImports(`
+      import { DocCommentNegativeStore } from './src/services/doc-comment-negative-store.js';
+      const s = new DocCommentNegativeStore(${JSON.stringify(root)});
+      console.log(s.isDenied('app','A','c','old-legitimate')); s.close();
+    `, { encoding: 'utf8', timeout: 15_000 });
+    expect(prior.status).toBe(0); expect(prior.stdout.trim()).toBe('false');
+    const s = new DocCommentNegativeStore(root); stores.push(s);
+    expect(s.isDenied('app', 'A', 'c', 'old-legitimate')).toBe(true);
+    expect(s.isDenied('app', 'A', 'c', 'new')).toBe(true);
+    expect(s.isDenied('app', 'B', 'c', 'new')).toBe(false);
+    const state = JSON.parse(readFileSync(s.paths('app', 'A').state, 'utf8'));
+    expect(() => s.recoverOffline({ version: 1, appId: 'app', fileToken: 'A', previousEpochId: state.uncertain.id,
+      ingressStoppedAndDrained: true, authoritativeHistoryComplete: false, evidenceReference: 'unavailable', operator: 'host-admin', negatives: [] } as never)).toThrow('negative_recovery_evidence_required');
+    s.recoverOffline({ version: 1, appId: 'app', fileToken: 'A', previousEpochId: state.uncertain.id,
+      ingressStoppedAndDrained: true, authoritativeHistoryComplete: true, evidenceReference: 'offline-audited-history-fixture', operator: 'host-admin', negatives: [{ commentId: 'c', replyId: 'edited' }] });
+    // Recovery process cannot authorize. Only a NEW daemon can claim handoff.
+    expect(s.isDenied('app', 'A', 'c', 'old-legitimate')).toBe(true);
+    const failedClaim=spawnSyncTsEvalWithRepoImports(`
+      import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+      import { DocCommentNegativeStore } from './src/services/doc-comment-negative-store.js';
+      const s = new DocCommentNegativeStore(${JSON.stringify(root)});
+      const saved=fs.fsyncSync; fs.fsyncSync=()=>{throw new Error('claim_fsync_failed')}; syncBuiltinESMExports();
+      let refused=false; try{s.prepareIngress('app','A')}catch{refused=true}
+      fs.fsyncSync=saved;syncBuiltinESMExports();
+      console.log(JSON.stringify({refused,denied:s.isDenied('app','A','c','old-legitimate')}));s.close();
+    `,{encoding:'utf8',timeout:15_000});
+    expect(failedClaim.status).toBe(0);expect(JSON.parse(failedClaim.stdout.trim())).toEqual({refused:true,denied:true});
+    const future = spawnSyncTsEvalWithRepoImports(`
+      import { DocCommentNegativeStore } from './src/services/doc-comment-negative-store.js';
+      const s = new DocCommentNegativeStore(${JSON.stringify(root)});
+      s.prepareStoredIngress('app');
+      console.log(JSON.stringify({ old:s.isDenied('app','A','c','old-legitimate'), edited:s.isDenied('app','A','c','edited') })); s.close();
+    `, { encoding: 'utf8', timeout: 15_000 });
+    expect(future.status).toBe(0); expect(JSON.parse(future.stdout.trim())).toEqual({ old: false, edited: true });
+    expect(s.isDenied('app', 'A', 'c', 'old-legitimate')).toBe(true);
+  });
+  it('rejects recovery while the original epoch holder is live and marker fsync failure before allow', () => {
+    const { store } = fixture(); store.initialize('app', 'A');
+    const state = JSON.parse(readFileSync(store.paths('app','A').state, 'utf8'));
+    expect(() => store.recoverOffline({ version:1,appId:'app',fileToken:'A',previousEpochId:state.uncertain.id,
+      ingressStoppedAndDrained:true,authoritativeHistoryComplete:true,evidenceReference:'fixture',operator:'host',negatives:[] })).toThrow('negative_recovery_holder_live_or_unverified');
+    vi.mocked(fs.fsyncSync).mockImplementationOnce(() => { throw new Error('epoch_fsync_failed'); });
+    expect(store.isDenied('app','failed','c','r')).toBe(true);
+    expect(store.isDenied('app','failed','c','r')).toBe(true);
+    expect(store.isDenied('app','B','c','r')).toBe(false);
+  });
+  it('defaults to anonymous after actual SIGKILL and refuses missing state or unaccounted pending recovery', () => {
+    const { root, store } = fixture();
+    const killed = spawnSyncTsScript('test/fixtures/comment-negative-double-fault.ts',[root,'crash'],{encoding:'utf8',timeout:15_000});
+    expect(killed.signal).toBe('SIGKILL');
+    expect(store.isDenied('app','A','c','old-legitimate')).toBe(true);
+    const path = store.paths('app','A').state;
+    const state = JSON.parse(readFileSync(path,'utf8'));
+    const evidence = {version:1 as const,appId:'app',fileToken:'A',previousEpochId:state.uncertain.id,
+      ingressStoppedAndDrained:true as const,authoritativeHistoryComplete:true as const,evidenceReference:'fixture',operator:'host',negatives:[]};
+    secureFiles.writeSecureHostFileSync(path,JSON.stringify({...state,pending:{commentId:'c',replyId:'lost-edit'}}));
+    expect(()=>store.recoverOffline(evidence)).toThrow('negative_recovery_pending_not_accounted');
+    rmSync(path);
+    expect(store.isDenied('app','A','c','new')).toBe(true);
+    expect(()=>store.recoverOffline(evidence)).toThrow('negative_recovery_epoch_mismatch');
+  });
+  it('requires host-only explicit offline management and records the successful audit before a new epoch', () => {
+    const {root,store}=fixture();
+    const prior=spawnSyncTsScript('test/fixtures/comment-negative-double-fault.ts',[root,'crash'],{encoding:'utf8',timeout:15_000});
+    expect(prior.signal).toBe('SIGKILL');
+    const state=JSON.parse(readFileSync(store.paths('app','A').state,'utf8'));
+    const manifest=join(root,'evidence.json');
+    writeFileSync(manifest,JSON.stringify({version:1,appId:'app',fileToken:'A',previousEpochId:state.uncertain.id,
+      ingressStoppedAndDrained:true,authoritativeHistoryComplete:true,evidenceReference:'audited-fixture',operator:'host-admin',negatives:[]}),{mode:0o600});
+    const args=[root,manifest,'--confirm-offline-audited'];
+    const agent=spawnSyncTsScript('scripts/recover-doc-comment-negative.ts',args,{encoding:'utf8',timeout:15_000,env:{...process.env,BOTMUX_SESSION_ID:'agent'}});
+    expect(agent.status).not.toBe(0); expect(agent.stderr).toContain('negative_recovery_agent_context_forbidden');
+    const env={...process.env}; delete env.BOTMUX_SESSION_ID; delete env.BOTMUX_LARK_TOOL_BINDING;
+    writeFileSync(join(root,'daemon.pid'),String(process.pid));
+    const live=spawnSyncTsScript('scripts/recover-doc-comment-negative.ts',args,{encoding:'utf8',timeout:15_000,env});
+    expect(live.status).not.toBe(0); expect(live.stderr).toContain('negative_recovery_daemon_live');
+    rmSync(join(root,'daemon.pid'));
+    const good=spawnSyncTsScript('scripts/recover-doc-comment-negative.ts',args,{encoding:'utf8',timeout:15_000,env});
+    expect(good.status).toBe(0);
+    const after=JSON.parse(readFileSync(store.paths('app','A').state,'utf8'));
+    expect(after.uncertain.id).toBe(state.uncertain.id);
+    expect(after.recovery.auditDigest).toBeTruthy();
+    expect(readFileSync(join(store.paths('app','A').state,'..',`recovery-${after.recovery.auditDigest}.json`),'utf8')).toBe(readFileSync(manifest,'utf8'));
+    rmSync(join(store.paths('app','A').state,'..',`recovery-${after.recovery.auditDigest}.json`));
+    const missing=spawnSyncTsEvalWithRepoImports(`
+      import{DocCommentNegativeStore}from'./src/services/doc-comment-negative-store.js';
+      const s=new DocCommentNegativeStore(${JSON.stringify(root)});let refused=false;
+      try{s.prepareStoredIngress('app')}catch{refused=true}
+      console.log(JSON.stringify({refused,denied:s.isDenied('app','A','c','r')}));s.close();
+    `,{encoding:'utf8',timeout:15_000});
+    expect(missing.status).toBe(0);expect(JSON.parse(missing.stdout.trim())).toEqual({refused:true,denied:true});
+  });
+  it('withholds all personal grants when the initial durable marker cannot be written', () => {
+    const {store}=fixture();
+    const write=vi.spyOn(secureFiles,'writeSecureHostFileSync').mockImplementationOnce(()=>{throw new Error('initial_epoch_eroffs');});
+    expect(store.isDenied('app','A','c','r')).toBe(true);
+    write.mockRestore();
+    expect(store.isDenied('app','A','c','r')).toBe(true);
+    expect(store.isDenied('app','B','c','r')).toBe(false);
+  });
+  it('recovers a failed directory fence only after accounting for durable pending evidence',()=>{
+    const {root,store}=fixture();
+    const old=spawnSyncTsEvalWithRepoImports(`
+      import {DocCommentNegativeStore} from './src/services/doc-comment-negative-store.js';
+      import {readSecureHostFileSync,writeSecureHostFileSync} from './src/platform/secure-host-file.js';
+      import {chmodSync} from 'node:fs';import{dirname}from'node:path';
+      const s=new DocCommentNegativeStore(${JSON.stringify(root)});s.initialize('app','A');
+      const p=s.paths('app','A').state;const state=JSON.parse(readSecureHostFileSync(p));
+      writeSecureHostFileSync(p,JSON.stringify({...state,pending:{commentId:'c',replyId:'lost'}}));
+      chmodSync(dirname(p),0o500);s.close();
+    `,{encoding:'utf8',timeout:15_000});
+    expect(old.status).toBe(0);
+    const state=JSON.parse(readFileSync(store.paths('app','A').state,'utf8'));
+    expect(()=>store.recoverOffline({version:1,appId:'app',fileToken:'A',previousEpochId:state.uncertain.id,
+      ingressStoppedAndDrained:true,authoritativeHistoryComplete:true,evidenceReference:'fixture',operator:'host',negatives:[]})).toThrow('negative_recovery_pending_not_accounted');
+    store.recoverOffline({version:1,appId:'app',fileToken:'A',previousEpochId:state.uncertain.id,
+      ingressStoppedAndDrained:true,authoritativeHistoryComplete:true,evidenceReference:'fixture',operator:'host',negatives:[{commentId:'c',replyId:'lost'}]});
+    const future=spawnSyncTsEvalWithRepoImports(`
+      import{DocCommentNegativeStore}from'./src/services/doc-comment-negative-store.js';
+      const s=new DocCommentNegativeStore(${JSON.stringify(root)});s.prepareIngress('app','A');
+      console.log(JSON.stringify({lost:s.isDenied('app','A','c','lost'),old:s.isDenied('app','A','c','legitimate')}));s.close();
+    `,{encoding:'utf8',timeout:15_000});
+    expect(future.status).toBe(0);expect(JSON.parse(future.stdout.trim())).toEqual({lost:true,old:false});
   });
 });

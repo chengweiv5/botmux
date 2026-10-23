@@ -25,6 +25,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const mocks = vi.hoisted(() => {
   // Isolate every sessionStore/config read-write under a per-process temp dir
@@ -3885,6 +3886,26 @@ describe('document comment canonical ownership and single-flight delivery', () =
       const options = mode === 'refork' ? mocks.forkWorker.mock.calls.at(-1)![2] : mocks.forkAdoptWorker.mock.calls.at(-1)![1];
       expect(options).toMatchObject({ trustedCaller: { requestUserOpenId: 'ou_author', senderType: 'user' } });
     }
+  });
+  it.each(['live','refork','adopt'] as const)('keeps restarted document personal authority anonymous on %s admission',async mode=>{
+    const sub=docSub(`fixture-old-epoch-${mode}`);
+    const ds=seedThreadSession(sub.sessionAnchor,'old epoch');ds.workerGeneration=ds.session.workerGeneration=4;
+    bindSubToSession(sub,ds);
+    const prior=spawnSyncTsEvalWithRepoImports(`
+      import{DocCommentNegativeStore}from'./src/services/doc-comment-negative-store.js';
+      const s=new DocCommentNegativeStore(${JSON.stringify(mocks.dataDir)});s.initialize(${JSON.stringify(APP)},${JSON.stringify(sub.fileToken)});s.close();
+    `,{encoding:'utf8',timeout:15_000});expect(prior.status).toBe(0);
+    const ctx={...docCtx(sub,`old-epoch-${mode}`),authorOpenId:'ou_author',operatorOpenId:'ou_author',entrySource:'ws'};
+    mocks.getDocComment.mockResolvedValueOnce({commentId:ctx.commentId,replies:[{replyId:ctx.replyId,userId:'ou_author',text:ctx.text}]});
+    mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce({openId:'ou_author',type:'user'});
+    const send=vi.fn();if(mode==='live')ds.worker={killed:false,send}as any;
+    if(mode==='adopt')ds.adoptedFrom='fixture';
+    const reserve=(options:any)=>{ds.workerGeneration=ds.session.workerGeneration=5;options.onWorkerGenerationReserved(5);ds.worker={killed:false,send}as any;};
+    if(mode==='refork')mocks.forkWorker.mockImplementationOnce((_ds:any,_input:any,resume:any,options:any)=>{reserve(resume);options.onAdmission('accepted');return true;});
+    if(mode==='adopt')mocks.forkAdoptWorker.mockImplementationOnce((_ds:any,options:any)=>{reserve(options);return'accepted';});
+    expect(await handleDocComment(ctx)).toBe(true);expect(resolveDocCommentTurnCaller(ds,ctx.replyId)).toBeUndefined();
+    if(mode==='live')expect(send.mock.calls[0][0].trustedCaller).toBeUndefined();
+    else expect((mode==='refork'?mocks.forkWorker.mock.calls.at(-1)![2]:mocks.forkAdoptWorker.mock.calls.at(-1)![1]).trustedCaller).toBeUndefined();
   });
 
   it.each(['operator', 'author', 'missing-reply', 'nonhuman', 'text-edited', 'unreadable'])(

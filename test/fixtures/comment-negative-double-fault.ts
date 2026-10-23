@@ -1,15 +1,16 @@
-/** Offline diagnostic, never reads credentials or contacts Lark. Reopen prints
- * the actual result (not an allow expectation): a false result is an explicitly
- * unresolved restart guarantee when ALL persistent writes failed. */
+/** Offline actual-process fixture. No credentials, tokens or Lark calls. */
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { dirname } from 'node:path';
 import { DocCommentNegativeStore } from '../../src/services/doc-comment-negative-store.js';
 
 const [root, phase] = process.argv.slice(2);
-if (!root || !['fail', 'reopen'].includes(phase)) throw new Error('root and phase required');
+if (!root || !['fail', 'reopen', 'crash'].includes(phase)) throw new Error('root and phase required');
 const store = new DocCommentNegativeStore(root);
-if (phase === 'reopen') {
+if (phase === 'crash') {
+  if (store.isDenied('app', 'A', 'c', 'old-legitimate')) throw new Error('epoch not authorized');
+  process.kill(process.pid, 'SIGKILL');
+} else if (phase === 'reopen') {
   console.log(JSON.stringify({ phase, deniedA: store.isDenied('app', 'A', 'c', 'r'),
     deniedB: store.isDenied('app', 'B', 'c', 'r') }));
 } else {

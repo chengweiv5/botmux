@@ -777,9 +777,10 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
-import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
+import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, getDocComment, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { pruneOldAttachments, collectProtectedAttachmentDirs } from './core/attachment-prune.js';
-import { learnFromMentions, getIdentity, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { learnFromMentions, getIdentity, resolveSender, resolveName, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
+import { registerDocCommentTurn, isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn } from './core/doc-comment-turn-provenance.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
 import { buildDocCommentTurnInput, buildDocWatchWarmupTurnInput } from './core/doc-comment-prompt.js';
 import { advanceDocCommentCursor, docCommentRepliesAfterCursor, latestDocCommentPollCursor } from './core/doc-comment-poller.js';
@@ -3986,7 +3987,7 @@ export async function noteTurnReceived(
   // every bot, reordering concurrent turns that the single-flight paths depend
   // on. A feature that is off must not perturb timing at all, so the await only
   // happens once a bot has actually opted in.
-  if (triggerUserAuthEnabledFor(ds)) {
+  if (triggerUserAuthEnabledFor(ds) && !isDocCommentTurn(ds, _turnId ?? triggerMessageId)) {
     await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
   }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
@@ -4191,6 +4192,15 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
   if (!botConfig.triggerUserAuth?.enabled) return;
+
+  // Comments use only the freshly-read exact reply author. Never enter the IM
+  // registry/delegation fallback, even if an old message occupies those slots.
+  if (isDocCommentTurn(ds, turnId)) {
+    await publishTurnCliIdentity({ botConfig, sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId, turnId, locale: localeForBot(ds.larkAppId),
+      senderOpenId: resolveDocCommentTurnCaller(ds, turnId)?.requestUserOpenId });
+    return;
+  }
 
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
@@ -28700,6 +28710,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
 
   const cleanupFailedDelivery = async (error: unknown): Promise<void> => {
     if (deliveryDs) {
+      forgetDocCommentTurn(deliveryDs, turnId);
       const runtimeTarget = deliveryDs.docCommentTurns?.get(turnId);
       if (targetMatchesThisTurn(runtimeTarget)) {
         deliveryDs.docCommentTurns?.delete(turnId);
@@ -28823,7 +28834,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
       ensureCurrentRoutingGeneration(generation, 'comment:reaction');
 
-      const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
+      // A display lookup must not mark an unverified ou_ as a human sender in
+      // the shared IM identity cache. Personal authority is verified below.
+      const displayName = ctx.authorOpenId ? await resolveName(larkAppId, ctx.authorOpenId) : undefined;
+      const sender = ctx.authorOpenId ? { openId: ctx.authorOpenId, type: 'user' as const, name: displayName } : undefined;
       ensureCurrentRoutingGeneration(generation, 'comment:sender');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
       const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
@@ -28860,6 +28874,38 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       });
       const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId, reactionType, reactionIdentity };
 
+      // Re-read here, including poll/persisted retry/refork deliveries. The
+      // event operator and saved payload may veto but cannot mint an author.
+      // Contact lookup is fresh and positive: ou_ alone also names bots.
+      let humanAuthor: string | undefined;
+      if (userReplyId && userReplyId === turnId) {
+        try {
+          const comment = await getDocComment(larkAppId,
+            { fileToken: sub.fileToken, fileType: sub.fileType }, commentId);
+          const reply = comment?.commentId === commentId
+            ? comment.replies.find(r => r.replyId === userReplyId) : undefined;
+          const author = reply?.userId;
+          if (author && /^ou_[A-Za-z0-9]+$/.test(author)
+            && (!ctx.authorOpenId || ctx.authorOpenId === author)
+            && (!ctx.operatorOpenId || ctx.operatorOpenId === author)
+            && reply!.text.replaceAll(BOT_REPLY_SENTINEL, '').trim() === text.trim()
+            && author !== getBot(larkAppId).botOpenId
+            && !isBotAuthoredReply(userReplyId) && !hasBotSentinel(reply!.text)) {
+            const verified = await resolveVerifiedUserIdentity(larkAppId, author);
+            if (verified?.type === 'user' && verified.openId === author) humanAuthor = author;
+          }
+        } catch { /* Missing positive testimony withholds personal authority. */ }
+      }
+      ensureCurrentRoutingGeneration(generation, 'comment:human-provenance');
+      sub = currentDocSubscriptionForDelivery(larkAppId, sub);
+      const bindCommentHuman = (workerGeneration: number): void => {
+        registerDocCommentTurn(ds!, { fileToken: sub.fileToken, fileType: sub.fileType,
+          commentId, replyId: userReplyId ?? '', turnId, workerGeneration, authorOpenId: humanAuthor });
+      };
+      const commentCaller = humanAuthor
+        ? { requestLarkAppId: larkAppId, requestUserOpenId: humanAuthor, senderType: 'user' as const }
+        : undefined;
+
       const selfBot = getBot(ds.larkAppId);
 
       if (ds.worker && !ds.worker.killed) {
@@ -28877,6 +28923,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
           turnId,
         });
         (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+        bindCommentHuman(ds.workerGeneration ?? 0);
+        delete cliInput.trustedCaller;
+        if (commentCaller) cliInput.trustedCaller = commentCaller;
+        await prepareTurnCliIdentity(ds, turnId);
         // rememberLastCliInput persists both the exact comment target and the
         // structured sidecar before any worker-visible delivery can occur.
         rememberLastCliInput(ds, promptContent, cliInput);
@@ -28886,7 +28936,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         if (ds.worker !== targetWorker || targetWorker.killed) {
           throw new Error('worker generation changed during comment:live-note');
         }
-        if (!sendWorkerInput(ds, cliInput, turnId)) {
+        if (!sendWorkerInput(ds, cliInput, turnId, { trustedCaller: commentCaller })) {
           throw new Error('worker became unavailable during comment:live-send');
         }
         acceptDocCommentSession(ds);
@@ -28938,6 +28988,14 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
+      delete wrappedInput.trustedCaller;
+      if (commentCaller) wrappedInput.trustedCaller = commentCaller;
+      // This new worker has no generation yet. Publish only the fresh ingress
+      // testimony; the reservation callback binds host authority before IPC.
+      if (triggerUserAuthEnabledFor(ds)) {
+        await publishTurnCliIdentity({ botConfig: dsBotCfg, sessionDataDir: config.session.dataDir,
+          sessionId: ds.session.sessionId, turnId, locale: loc, senderOpenId: humanAuthor });
+      }
       rememberLastCliInput(ds, promptContent, wrappedInput);
       await noteTurnReceived(ds, commentId, text, sender, turnId);
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
@@ -28947,7 +29005,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
       sessionStore.updateSession(ds.session);
       if (ds.adoptedFrom) {
-        if (forkAdoptWorker(ds, { payload: wrappedInput, turnId }) !== 'accepted') {
+        if (forkAdoptWorker(ds, { payload: wrappedInput, turnId, trustedCaller: commentCaller,
+          onWorkerGenerationReserved: bindCommentHuman }) !== 'accepted') {
           throw new Error('adopt worker fork did not accept document comment input');
         }
         acceptDocCommentSession(ds);
@@ -28956,7 +29015,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         const forked = forkWorker(
           ds,
           wrappedInput,
-          { resume: ds.hasHistory, turnId },
+          { resume: ds.hasHistory, turnId, trustedCaller: commentCaller,
+            onWorkerGenerationReserved: bindCommentHuman },
           {
             onAdmission: admission => { forkAdmission = admission; },
             deferDuringDeviceIsolation: false,
@@ -29064,6 +29124,7 @@ async function retryPendingDocCommentDeliveries(
           priorReplies: pending.priorReplies,
           isWhole: pending.isWhole,
           authorOpenId: pending.authorOpenId,
+          operatorOpenId: pending.operatorOpenId,
         });
         if (!accepted) {
           blockedFiles.add(snapshot.fileToken);

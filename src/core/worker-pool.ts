@@ -137,6 +137,7 @@ import { readGroupContextAuthorOrigin } from '../services/group-context-publicat
 import { bindGroupContextWorkerGeneration, readGroupContextDeliveryBinding, hasPreparedGroupContext, type GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../services/group-context-prompt.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
+import { isDocCommentTurn, resolveDocCommentTurnCaller, forgetDocCommentTurn, clearDocCommentTurnProvenance } from './doc-comment-turn-provenance.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
@@ -12699,6 +12700,12 @@ export function sendWorkerInput(
     : undefined);
   const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
   const routingTurnId = turnId ?? replyTurnId;
+  if (routingTurnId && isDocCommentTurn(ds, routingTurnId)) {
+    const caller = resolveDocCommentTurnCaller(ds, routingTurnId);
+    opts = { ...opts, trustedCaller: caller };
+    normalized = { ...normalized, trustedCaller: caller };
+    if (!caller) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
+  }
   const replyContext = frozenReplyContextForTurn(ds, routingTurnId);
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, routingTurnId);
   let nativeSessionTitlePrompt: string | undefined;
@@ -13804,7 +13811,7 @@ export function forkWorker(
   } else {
     resume = resumeOrTurnId;
   }
-  const initTrustedCaller = promptPayload.trustedCaller
+  let initTrustedCaller = promptPayload.trustedCaller
     ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
       ? resumeOrTurnId.trustedCaller
       : undefined);
@@ -14188,6 +14195,10 @@ export function forkWorker(
   const workerGeneration = reserveWorkerGeneration(ds);
   bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
   onWorkerGenerationReserved?.(workerGeneration);
+  if (initTurnId && isDocCommentTurn(ds, initTurnId)) {
+    initTrustedCaller = resolveDocCommentTurnCaller(ds, initTurnId);
+    if (!initTrustedCaller) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
+  }
   if (initAttributionTurnId?.startsWith('om_')) {
     ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
   }
@@ -15122,7 +15133,10 @@ function isMeetingDrivenTurn(
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
 }
 
-function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+export function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
+  if (isDocCommentTurn(ds, turnId)) {
+    return resolveDocCommentTurnCaller(ds, turnId)?.requestUserOpenId;
+  }
   // The daemon owns this per-turn sender map. The worker contributes only the
   // turn id over private IPC; it can never choose which human that id denotes.
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
@@ -18280,6 +18294,7 @@ function setupWorkerHandlers(
           );
         }
         forgetScheduledTurnCaller(ds, msg.turnId);
+        forgetDocCommentTurn(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
@@ -21247,6 +21262,7 @@ export function reserveWorkerGeneration(ds: DaemonSession): number {
     if (previousPreviewTarget !== undefined) ds.session.previewTarget = previousPreviewTarget;
     throw error;
   }
+  clearDocCommentTurnProvenance(ds);
   if (previousPreviewTarget !== undefined) publishSessionPreviewCleared(ds.session.sessionId);
   // Reservation is the first durable proof that the previous generation has
   // lost authority. Clear its TUI slot before any environment check, adapter
@@ -21351,6 +21367,11 @@ export function forkAdoptWorker(
   const workerGeneration = reserveWorkerGeneration(ds);
   bindPreparedGroupContextWorker(ds, opts?.turnId, workerGeneration);
   opts?.onWorkerGenerationReserved?.(workerGeneration);
+  if (opts?.turnId && isDocCommentTurn(ds, opts.turnId)) {
+    const caller = resolveDocCommentTurnCaller(ds, opts.turnId);
+    opts = { ...opts, trustedCaller: caller };
+    if (!caller) clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
+  }
 
   // Guard against double-fork
   if (ds.worker && !ds.worker.killed) {

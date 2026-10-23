@@ -52,7 +52,7 @@ describe('passesDocCommentAuditGate', () => {
     mocks.rollback.mockReset();
     ({ __testOnly_passesDocCommentAuditGate: gate } =
       await import('../src/im/lark/event-dispatcher.js'));
-  });
+  }, 30_000);
 
   it('owner 本人触发：放行，且不打扰自己、不回滚', async () => {
     await expect(gate('app-test', FILE_TOKEN, OWNER, '正文', mocks.rollback)).resolves.toBe(true);

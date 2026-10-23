@@ -524,6 +524,7 @@ import {
   sessionPreviewDescriptor,
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
+import { isDocCommentTurn, currentDocCommentHuman } from './doc-comment-turn-provenance.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
@@ -3103,7 +3104,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = origin?.callerOpenId;
   const turnId = origin?.turnId;
   if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const commentTurn = isDocCommentTurn(ds, turnId);
+  if (commentTurn && !currentDocCommentHuman(ds, turnId)) {
+    return jsonRes(res, 403, { ok: false, error: 'current_comment_actor_unverified' });
+  }
+  const worker = ds.worker;
+  const generation = ds.workerGeneration;
+  const capability = origin?.capability;
   const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  if (commentTurn && delegated) return jsonRes(res, 403, { ok: false, error: 'current_comment_actor_unverified' });
   const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
   if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
     || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
@@ -3125,7 +3134,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
-  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+  if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+    || ds.worker !== worker || !worker || worker.killed || ds.workerGeneration !== generation
+    || ds.larkAppId !== bot.larkAppId || sessionTransportDisabled(ds)
+    || ds.managedTurnOrigin?.capability !== capability
+    || commentTurn && currentDocCommentHuman(ds, turnId) !== sender
+    || ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
     || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
@@ -3253,6 +3267,10 @@ for (const action of ['auth-request', 'auth-status']) {
     const requestingUser = (): string | undefined => {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
+      if (isDocCommentTurn(ds, liveOrigin.turnId)) {
+        if (getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId)) return undefined;
+        return currentDocCommentHuman(ds, liveOrigin.turnId);
+      }
       const grant = getLarkToolDelegation(config.session.dataDir, params.sessionId, liveOrigin.turnId);
       if (!grant) return liveOrigin.callerOpenId;
       if (grant.denialReason || !grant.targetOpenId || !grant.tools.includes('lark-cli')
@@ -3393,6 +3411,8 @@ for (const action of ['auth-request', 'auth-status']) {
       // the same human frozen on this request; a dispatch bot or another human
       // retires the grant.
       const liveCaller = requestingUser();
+      if (ds.managedTurnOrigin?.turnId && isDocCommentTurn(ds, ds.managedTurnOrigin.turnId)
+        && liveCaller === undefined) return false;
       if (liveCaller !== undefined && liveCaller !== callerOpenId) return false;
       try {
         const currentConfig = getBot(ds.larkAppId).config;

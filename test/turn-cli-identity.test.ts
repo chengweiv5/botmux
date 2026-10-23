@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { isDocCommentTurn, registerDocCommentTurn, resolveDocCommentTurnCaller } from '../src/core/doc-comment-turn-provenance.js';
 
 const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
@@ -417,6 +418,7 @@ describe('target daemon consumes signed message authority', () => {
       ? { status: 'transient' } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+      isDocCommentTurn, resolveDocCommentTurnCaller,
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
@@ -650,6 +652,24 @@ describe('target daemon consumes signed message authority', () => {
     await h.run();
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('original-user');
+  });
+  it.each([true, false])('uses only the host-bound comment author for trigger-user credentials (human=%s)', async human => {
+    const h = await targetHarness();
+    h.ds.session.larkAppId = APP;
+    h.ds.session.status = 'active';
+    h.ds.workerGeneration = h.ds.session.workerGeneration = 3;
+    const target = { fileToken: 'fixture_file', fileType: 'docx', commentId: 'fixture_comment', replyId: '70123', turnId: '70123', replyToOpenId: ALICE };
+    h.ds.session.docCommentTargets = { '70123': target };
+    h.ds.session.replyTargets['70123'] = { senderOpenId: ALICE };
+    registerDocCommentTurn(h.ds, { ...target, workerGeneration: 3, authorOpenId: human ? 'ou_commentauthor' : undefined });
+    bytedcliJwts.set(ALICE, { cloudJwt: 'wrong-owner-credential' });
+    bytedcliJwts.set('ou_commentauthor', { cloudJwt: 'comment-credential' });
+    await h.run('70123');
+    const content = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(content).not.toContain('wrong-owner-credential');
+    if (human) expect(content).toContain('comment-credential');
+    else expect(content).not.toContain('comment-credential');
+    expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);

@@ -173,6 +173,7 @@ import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { registerDocCommentTurn } from '../src/core/doc-comment-turn-provenance.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
@@ -273,6 +274,32 @@ describe('Worker ready: set_display_mode re-sync', () => {
       closeSession: closeSessionMock,
     });
     setActiveSessionsRegistry(new Map());
+  });
+
+  it('publishes only daemon-admitted comment author and ignores forged/stale worker callers', async () => {
+    const ds = makeDs({ workerGeneration: 2 });
+    ds.session.larkAppId = ds.larkAppId;
+    ds.session.workerGeneration = 2;
+    const target = { fileToken: 'fixture', fileType: 'docx', commentId: '70000', replyId: '70001', turnId: '70001', replyToOpenId: 'ou_owner' };
+    ds.session.docCommentTargets = { '70001': target };
+    const worker = ds.worker as any;
+    setupActiveWorkerHandlers(ds, worker);
+    const generation = ds.workerGeneration!;
+    registerDocCommentTurn(ds, { ...target, workerGeneration: generation, authorOpenId: 'ou_author' });
+    const origin = { type: 'managed_turn_origin', sessionId: ds.session.sessionId, capability: 'fixture_cap', turnId: '70001', callerOpenId: 'ou_forged' };
+    worker.emit('message', origin);
+    expect(ds.managedTurnOrigin?.callerOpenId).toBe('ou_author');
+    worker.emit('message', { ...origin, turnId: '70002' });
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    worker.emit('message', origin);
+    ds.worker = makeFakeWorker();
+    worker.emit('message', { ...origin, capability: 'stale_cap' });
+    expect(ds.managedTurnOrigin?.capability).toBe('fixture_cap');
+    ds.worker = worker;
+    ds.workerGeneration = ds.session.workerGeneration = generation + 1;
+    worker.emit('message', origin);
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    await flush();
   });
 
   it.each(['ready', 'screen_update', 'fallback'].flatMap(source => ['publish', 'stop', 'replace'].map(outcome => ({ source, outcome }))))(

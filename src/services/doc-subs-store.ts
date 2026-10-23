@@ -45,6 +45,8 @@ export interface PendingDocCommentDelivery {
   priorReplies?: Array<{ authorOpenId?: string; text: string }>;
   isWhole?: boolean;
   authorOpenId?: string;
+  /** Preserve an edit actor mismatch across retries; not identity testimony. */
+  operatorOpenId?: string;
   queuedAt: number;
   /** Delivery crossed the daemon admission boundary; --all keeps this marker until cursor commit. */
   acceptedAt?: number;

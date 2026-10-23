@@ -15,6 +15,7 @@ import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
+import { registerDocCommentTurn, clearDocCommentTurnProvenance } from '../src/core/doc-comment-turn-provenance.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
@@ -48,6 +49,73 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
+  function commentTurn(turnId = 'reply_comment', author = 'ou_author') {
+    session.session.larkAppId = 'cli_bound';
+    session.workerGeneration = session.session.workerGeneration = 1;
+    const target = { fileToken: 'fixture_file', fileType: 'docx', commentId: 'fixture_comment', replyId: turnId, turnId,
+      replyToOpenId: 'ou_owner' };
+    (session.session.docCommentTargets ??= {})[turnId] = target;
+    registerDocCommentTurn(session, { ...target, workerGeneration: 1, authorOpenId: author });
+    session.managedTurnOrigin = { turnId, capability: 'comment_cap', callerOpenId: author };
+    return target;
+  }
+  it('connects exact comment author to bound --as user and auth request/status without trigger-user policy', async () => {
+    commentTurn();
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_author', type: 'user' });
+    expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_bound', credential: 'bound-user-token' });
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_author');
+    const poll = vi.fn(async () => ({ status: 'ready' as const, token: 'fixture-grant' }));
+    vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({ authUrl: 'https://example.com/fixture-auth',
+      scopes: ['im:chat:read'], expiresIn: 300, poll });
+    const auth = (action: string, body: object) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+    });
+    const grant = await (await auth('auth-request', { scopes: ['im:chat:read'] })).json();
+    expect(grant.ok).toBe(true);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', ['im:chat:read'], 'ou_author', expect.any(Function));
+    expect(await (await auth('auth-status', { requestId: grant.requestId })).json()).toEqual({ ok: true, status: 'ready' });
+    poll.mockClear();
+    commentTurn('reply_other', 'ou_other');
+    expect((await auth('auth-status', { requestId: grant.requestId })).status).toBe(409);
+    expect(poll).not.toHaveBeenCalled();
+  });
+  it('keeps an exact running comment author when a concurrent comment is queued', async () => {
+    commentTurn();
+    const origin = session.managedTurnOrigin;
+    commentTurn('reply_queued', 'ou_queued');
+    session.managedTurnOrigin = origin;
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_author', type: 'user' });
+    expect((await request('user')).status).toBe(200);
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_author');
+  });
+  it.each(['restart', 'worker-generation', 'file', 'comment', 'reply', 'origin-caller'])(
+    'withholds comment user credentials and OAuth when %s testimony differs', async boundary => {
+      const target = commentTurn();
+      if (boundary === 'restart') clearDocCommentTurnProvenance(session);
+      if (boundary === 'worker-generation') session.workerGeneration++;
+      if (boundary === 'file') target.fileToken = 'different';
+      if (boundary === 'comment') target.commentId = 'different';
+      if (boundary === 'reply') target.replyId = 'different';
+      if (boundary === 'origin-caller') session.managedTurnOrigin.callerOpenId = 'ou_owner';
+      expect((await request('user')).status).toBe(403);
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+        body: JSON.stringify({ scopes: ['im:chat:read'] }),
+      });
+      expect(response.status).toBe(403);
+      expect((await request('bot')).status).toBe(200);
+    });
+  it('does not return comment credentials across a worker/capability rotation during token lookup', async () => {
+    commentTurn();
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_author', type: 'user' });
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      session.managedTurnOrigin.capability = 'rotated'; return 'late-private-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('late-private-token');
+  });
   async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',

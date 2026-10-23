@@ -195,6 +195,11 @@ describe('document comment event identity', () => {
   it('事件中的明确操作者优先于 reply 作者', async () => {
     await dispatch({ ...event(), operator_id: { open_id: OTHER } });
     expect(mocks.sendUserMessage).toHaveBeenCalledWith(APP, OWNER, expect.stringContaining(OTHER.slice(0, 12)));
+    expect(mocks.handleDocComment).toHaveBeenCalledWith(expect.objectContaining({
+      authorOpenId: OWNER, operatorOpenId: OTHER, replyId: REPLY,
+    }));
+    expect(mocks.settleDocCommentWsDelivery).toHaveBeenCalledWith(expect.any(String), APP, FILE,
+      expect.objectContaining({ authorOpenId: OWNER, operatorOpenId: OTHER }), true);
   });
 
   it('正文不可读且触发者为 bot 自己时不发通知也不打失败标记', async () => {

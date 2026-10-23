@@ -3539,6 +3539,8 @@ export interface DocCommentContext {
   isWhole?: boolean;
   /** 评论发表者 open_id。 */
   authorOpenId?: string;
+  /** Event actor is a veto only, never the comment's authorization principal. */
+  operatorOpenId?: string;
 }
 
 /**
@@ -4459,6 +4461,7 @@ async function processCommentEvent(
     })).filter(reply => reply.text.length > 0),
     isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
+    operatorOpenId: parsed.operatorOpenId,
   };
   logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
   // 标题补齐（只在缺时补，**故意不 await**）：评论事件热路径，用户在等回复，不能
@@ -4487,6 +4490,7 @@ async function processCommentEvent(
       priorReplies: delivery.priorReplies,
       isWhole: delivery.isWhole,
       authorOpenId: delivery.authorOpenId,
+      operatorOpenId: delivery.operatorOpenId,
       queuedAt: Date.now(),
     },
     accepted,

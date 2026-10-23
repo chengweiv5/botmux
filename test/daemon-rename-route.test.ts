@@ -56,6 +56,8 @@ const mocks = vi.hoisted(() => {
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
         : undefined
     )),
+    getDocComment: vi.fn(async () => null as any),
+    resolveVerifiedUserIdentity: vi.fn(async () => undefined as any),
     sessions,
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => {
       const session = {
@@ -213,10 +215,17 @@ vi.mock('../src/im/lark/card-handler.js', async () => {
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
-  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
+  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args),
+    resolveName: async (app: string, openId: string) => (await mocks.resolveSender(app, openId, 'user'))?.name,
+    resolveVerifiedUserIdentity: (...args: any[]) => mocks.resolveVerifiedUserIdentity(...args) };
 });
 
+vi.mock('../src/im/lark/doc-comment.js', async importOriginal => ({
+  ...await importOriginal<any>(), getDocComment: mocks.getDocComment,
+}));
+
 import { registerBot } from '../src/bot-registry.js';
+import { resolveDocCommentTurnCaller } from '../src/core/doc-comment-turn-provenance.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
@@ -3781,6 +3790,61 @@ describe('document comment canonical ownership and single-flight delivery', () =
     });
     putDocSubscription(config.session.dataDir, APP, sub);
   }
+
+  it.each(['live', 'refork', 'adopt'] as const)('binds fresh reply author before %s worker input, never owner', async mode => {
+    const sub = docSub(`fixture-human-${mode}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'human fixture');
+    ds.workerGeneration = ds.session.workerGeneration = 4;
+    ds.session.ownerOpenId = 'ou_unrelated';
+    ds.session.lastCallerOpenId = 'ou_oldIM';
+    bindSubToSession(sub, ds);
+    const ctx = { ...docCtx(sub, mode), authorOpenId: 'ou_author' };
+    mocks.getDocComment.mockResolvedValueOnce({ commentId: ctx.commentId,
+      replies: [{ replyId: ctx.replyId, userId: 'ou_author', text: ctx.text }] });
+    mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce({ openId: 'ou_author', type: 'user' });
+    const send = vi.fn();
+    if (mode === 'live') ds.worker = { killed: false, send } as any;
+    if (mode === 'adopt') ds.adoptedFrom = 'fixture-adopt';
+    const reserve = (options: any) => {
+      ds.workerGeneration = ds.session.workerGeneration = 5;
+      options.onWorkerGenerationReserved(5);
+      ds.worker = { killed: false, send } as any;
+    };
+    if (mode === 'refork') mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, resume: any, options: any) => {
+      reserve(resume); options.onAdmission('accepted'); return true;
+    });
+    if (mode === 'adopt') mocks.forkAdoptWorker.mockImplementationOnce((_ds: any, options: any) => { reserve(options); return 'accepted'; });
+    expect(await handleDocComment(ctx)).toBe(true);
+    expect(mocks.getDocComment).toHaveBeenCalledWith(APP, { fileToken: sub.fileToken, fileType: 'docx' }, ctx.commentId);
+    expect(mocks.resolveVerifiedUserIdentity).toHaveBeenCalledWith(APP, 'ou_author');
+    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toMatchObject({ requestLarkAppId: APP, requestUserOpenId: 'ou_author', senderType: 'user' });
+    if (mode === 'live') expect(send).toHaveBeenCalledWith(expect.objectContaining({ trustedCaller: expect.objectContaining({ requestUserOpenId: 'ou_author' }) }));
+    else {
+      const options = mode === 'refork' ? mocks.forkWorker.mock.calls.at(-1)![2] : mocks.forkAdoptWorker.mock.calls.at(-1)![1];
+      expect(options).toMatchObject({ trustedCaller: { requestUserOpenId: 'ou_author', senderType: 'user' } });
+    }
+  });
+
+  it.each(['operator', 'author', 'missing-reply', 'nonhuman', 'text-edited', 'unreadable'])(
+    'withholds personal identity on %s while preserving bot comment delivery', async boundary => {
+      const sub = docSub(`fixture-deny-${boundary}`);
+      const ds = seedThreadSession(sub.sessionAnchor, 'deny fixture');
+      ds.workerGeneration = ds.session.workerGeneration = 1;
+      const send = vi.fn(); ds.worker = { killed: false, send } as any;
+      bindSubToSession(sub, ds);
+      const ctx = { ...docCtx(sub, boundary), authorOpenId: 'ou_author',
+        ...(boundary === 'operator' ? { operatorOpenId: 'ou_editor' } : {}) };
+      mocks.getDocComment.mockResolvedValueOnce(boundary === 'unreadable' ? null : {
+        commentId: ctx.commentId, replies: [{ replyId: boundary === 'missing-reply' ? 'wrong' : ctx.replyId,
+          userId: boundary === 'author' ? 'ou_different' : 'ou_author',
+          text: boundary === 'text-edited' ? 'changed' : ctx.text }],
+      });
+      mocks.resolveVerifiedUserIdentity.mockResolvedValueOnce(boundary === 'nonhuman' ? undefined : { openId: 'ou_author', type: 'user' });
+      expect(await handleDocComment(ctx)).toBe(true);
+      expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toBeUndefined();
+      expect(send).toHaveBeenCalledWith(expect.not.objectContaining({ trustedCaller: expect.anything() }));
+      mocks.resolveVerifiedUserIdentity.mockReset();
+  });
 
   it('leaves the provider cursor retryable when a worker-null setup owner exists', async () => {
     const sub = docSub(`doc-protected-${Date.now()}`);

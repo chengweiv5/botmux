@@ -7,6 +7,7 @@ import { registerDocCommentTurn, resolveDocCommentTurnCaller, isDocCommentTurn,
   docCommentCliLifetime, revokeDocCommentCliLifetime } from '../src/core/doc-comment-turn-provenance.js';
 import { vetoDocCommentHuman } from '../src/core/doc-comment-turn-provenance.js';
 import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({docCommentFullIsolationVerified:(ds:any)=>ds.fixtureFull===true}));
 
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -16,6 +17,7 @@ vi.mock('node:fs', async importOriginal => {
 function fixture() {
   const target = { fileToken: 'file', fileType: 'docx', commentId: 'comment', replyId: 'reply', turnId: 'reply', replyToOpenId: 'ou_owner' };
   const ds = { larkAppId: 'cli_app', workerGeneration: 1, worker: { killed: false },
+    fixtureFull:true,
     session: { sessionId: 'session', larkAppId: 'cli_app', status: 'active', workerGeneration: 1,
       docCommentTargets: { reply: target }, replyTargets: { reply: { senderOpenId: 'ou_oldIM' } } },
     managedTurnOrigin: { capability: 'cap', turnId: 'reply', callerOpenId: 'ou_author' },
@@ -26,6 +28,12 @@ function fixture() {
 }
 
 describe('daemon-owned exact comment turn provenance', () => {
+  it('withholds comment human in off/credential-only/unproved modes without changing an IM Ask caller',()=>{
+    const {ds}=fixture();(ds as any).fixtureFull=false;
+    expect(currentGatewayCallerOpenId(ds,'reply')).toBeUndefined();
+    ds.session.replyTargets!.om_answer={senderOpenId:'ou_answer',turnId:'om_answer',createdAt:new Date().toISOString()};
+    expect(currentGatewayCallerOpenId(ds,'om_answer')).toBe('ou_answer');
+  });
   it('revokes an in-flight author and fresh testimony after both persistent veto fences fail', async () => {
     const { ds, record, target } = fixture();
     target.fileToken = 'double-fault-file'; registerDocCommentTurn(ds, { ...record, fileToken: target.fileToken });

@@ -654,7 +654,7 @@ describe('target daemon consumes signed message authority', () => {
     expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('original-user');
   });
-  it.each([true, false])('uses only the host-bound comment author for trigger-user credentials (human=%s)', async human => {
+  it.each([true, false])('never publishes raw trigger-user credentials for a comment (human=%s)', async human => {
     const h = await targetHarness();
     h.ds.session.larkAppId = APP;
     h.ds.session.status = 'active';
@@ -666,10 +666,10 @@ describe('target daemon consumes signed message authority', () => {
     bytedcliJwts.set(ALICE, { cloudJwt: 'wrong-owner-credential' });
     bytedcliJwts.set('ou_commentauthor', { cloudJwt: 'comment-credential' });
     await h.run('70123');
-    const content = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    const path=sessionIdentityPath(dir, SESSION, 'bytedcli');
+    const content = existsSync(path)?readFileSync(path,'utf8'):'';
     expect(content).not.toContain('wrong-owner-credential');
-    if (human) expect(content).toContain('comment-credential');
-    else expect(content).not.toContain('comment-credential');
+    expect(content).not.toContain('comment-credential');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
   });
   it('does not republish credentials after an editor veto arrives during the personal provider await', async () => {
@@ -680,13 +680,17 @@ describe('target daemon consumes signed message authority', () => {
     h.ds.session.docCommentTargets = { '70234': target };
     registerDocCommentTurn(h.ds, { ...target, workerGeneration: 3, authorOpenId: 'ou_commentauthor' });
     const provider = await import('../src/services/bytedcli-auth.js');
-    vi.mocked(provider.mintBytedcliJwts).mockImplementationOnce(async () => {
+    const mint=vi.mocked(provider.mintBytedcliJwts);
+    mint.mockClear();
+    mint.mockImplementationOnce(async () => {
       vetoDocCommentHuman(APP, target.fileToken, target.commentId, target.replyId);
       return { cloudJwt: 'late-comment-secret' };
     });
     await h.run('70234');
     const path = sessionIdentityPath(dir, SESSION, 'bytedcli');
     expect(existsSync(path) ? readFileSync(path, 'utf8') : '').not.toContain('late-comment-secret');
+    expect(mint).not.toHaveBeenCalled();
+    mint.mockReset();mint.mockImplementation(async(id:string)=>bytedcliJwts.get(id));
   });
   it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
     const h = await targetHarness(options);

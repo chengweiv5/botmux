@@ -17,7 +17,7 @@
  * stale report is dropped once the newer turn IS active. See the last case.
  */
 import { type ChildProcess } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -129,6 +129,7 @@ function lastManagedOriginTurnId(harness: Harness): string | undefined {
 
 function startWorker(): Harness {
   const root = mkdtempSync(join(tmpdir(), 'botmux-turn-idle-'));
+  const work=join(root,'work');mkdirSync(work);
   tempDirs.add(root);
   // A CLI that boots, renders nothing and stays alive: dsh-tui's readyPattern
   // (`❯`) is therefore never seen, so the PTY-quiescence IdleDetector can never
@@ -168,7 +169,7 @@ function startWorker(): Harness {
     sessionId,
     chatId: 'oc_turn_idle',
     rootMessageId: 'om_turn_idle',
-    workingDir: root,
+    workingDir: work,
     cliId: 'dsh-tui',
     cliPathOverride: fakeCli,
     backendType: 'pty',

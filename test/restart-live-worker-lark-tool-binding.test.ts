@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+// Real restart boundary only; kernel proof is executed in integration tests.
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({docCommentFullIsolationVerified:()=>true}));
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {

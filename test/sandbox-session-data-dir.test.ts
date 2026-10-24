@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
@@ -28,6 +28,12 @@ function allowTestRuntime(policy: FsPolicy) {
   for (const path of [repoRoot, realpathSync(join(repoRoot, 'node_modules')), dirname(realpathSync(runtime.command))]) {
     policy.rules.push({ path, access: 'readOnly', source: 'internal' });
   }
+  // The readonly checkout retains an absolute node_modules symlink. Preserve
+  // its target spelling too; otherwise Node cannot follow it inside tmpfs /.
+  try {
+    const target=readlinkSync(join(repoRoot,'node_modules'));
+    if(isAbsolute(target))policy.rules.push({path:target,access:'readOnly',source:'internal'});
+  } catch { /* a normal dependency directory needs no alias */ }
   return { repoRoot, ...runtime };
 }
 

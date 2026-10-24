@@ -15781,6 +15781,7 @@ function setupWorkerHandlers(
         ds.localProcessAttestation = {
           backendType: msg.backendType,
           credentialIsolated: msg.credentialIsolated,
+          ...(msg.commentFullIsolation ? { commentFullIsolation: msg.commentFullIsolation } : {}),
           ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
@@ -15791,6 +15792,9 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
+        // The opening comment may have been queued before CLI kernel proof
+        // existed. Re-publication derives human authority only after this IPC
+        // observation; it never restores raw credential files.
         break;
       }
       case 'queued_activation_submitted': {

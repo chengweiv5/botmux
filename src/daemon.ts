@@ -4197,15 +4197,9 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // Comments use only the freshly-read exact reply author. Never enter the IM
   // registry/delegation fallback, even if an old message occupies those slots.
   if (isDocCommentTurn(ds, turnId)) {
-    const caller = resolveDocCommentTurnCaller(ds, turnId)?.requestUserOpenId;
-    await publishTurnCliIdentity({ botConfig, sessionDataDir: config.session.dataDir,
-      sessionId: ds.session.sessionId, turnId, locale: localeForBot(ds.larkAppId),
-      senderOpenId: caller });
-    // A concurrent WS veto/restart may arrive while credential lookup awaits.
-    // Never let its late publication recreate the credentials just revoked.
-    if (caller && resolveDocCommentTurnCaller(ds, turnId)?.requestUserOpenId !== caller) {
-      clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
-    }
+    // Stable files are readable by every old descendant. Comments use only
+    // the bound per-request broker; never publish raw personal credentials.
+    clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
     return;
   }
 
@@ -28913,6 +28907,9 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         reactionIdentity,
       });
       const docTarget = { fileToken: sub.fileToken, fileType: sub.fileType, commentId, replyToName: sender?.name, replyToOpenId: ctx.authorOpenId, turnId, replyId: userReplyId, reactionId, reactionType, reactionIdentity };
+      // A comment never exposes raw user credentials through stable files.
+      // Bound lark-tool uses its per-request authority broker instead.
+      clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
 
       // Re-read here, including poll/persisted retry/refork deliveries. The
       // event operator and saved payload may veto but cannot mint an author.
@@ -29005,6 +29002,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       }
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
+      commentCaller = undefined; // new CLI lifetime has no live kernel proof yet
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
       if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
       ds.usageLimit = undefined;
@@ -29044,8 +29042,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       // This new worker has no generation yet. Publish only the fresh ingress
       // testimony; the reservation callback binds host authority before IPC.
       if (triggerUserAuthEnabledFor(ds)) {
-        await publishTurnCliIdentity({ botConfig: dsBotCfg, sessionDataDir: config.session.dataDir,
-          sessionId: ds.session.sessionId, turnId, locale: loc, senderOpenId: humanAuthor });
+        clearAllSessionIdentities(config.session.dataDir, ds.session.sessionId);
       }
       rememberLastCliInput(ds, promptContent, wrappedInput);
       await noteTurnReceived(ds, commentId, text, sender, turnId);

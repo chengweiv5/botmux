@@ -26,6 +26,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'nod
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({docCommentFullIsolationVerified:(ds:any)=>!!ds.worker&&!ds.adoptedFrom&&ds.worker.killed!==true}));
 
 const mocks = vi.hoisted(() => {
   // Isolate every sessionStore/config read-write under a per-process temp dir
@@ -3880,11 +3881,14 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(await handleDocComment(ctx)).toBe(true);
     expect(mocks.getDocComment).toHaveBeenCalledWith(APP, { fileToken: sub.fileToken, fileType: 'docx' }, ctx.commentId);
     expect(mocks.resolveVerifiedUserIdentity).toHaveBeenCalledWith(APP, 'ou_author');
-    expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toMatchObject({ requestLarkAppId: APP, requestUserOpenId: 'ou_author', senderType: 'user' });
+    if(mode==='adopt')expect(resolveDocCommentTurnCaller(ds,ctx.replyId)).toBeUndefined();
+    else expect(resolveDocCommentTurnCaller(ds, ctx.replyId)).toMatchObject({ requestLarkAppId: APP, requestUserOpenId: 'ou_author', senderType: 'user' });
     if (mode === 'live') expect(send).toHaveBeenCalledWith(expect.objectContaining({ trustedCaller: expect.objectContaining({ requestUserOpenId: 'ou_author' }) }));
     else {
       const options = mode === 'refork' ? mocks.forkWorker.mock.calls.at(-1)![2] : mocks.forkAdoptWorker.mock.calls.at(-1)![1];
-      expect(options).toMatchObject({ trustedCaller: { requestUserOpenId: 'ou_author', senderType: 'user' } });
+      // A cold generation has no kernel proof before reservation; admission
+      // carries content only. Caller can be derived after private CLI proof.
+      expect(options.trustedCaller).toBeUndefined();
     }
   });
   it.each(['live','refork','adopt'] as const)('keeps restarted document personal authority anonymous on %s admission',async mode=>{

@@ -62,6 +62,8 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, resolveLarkCliLinuxStoreDir, larkCliChildDataRoot, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
 import { docCommentHostOnlyPaths, assertDocCommentHostStorageOutsideWritableRoots } from './core/doc-comment-host-boundary.js';
 import { prepareDocCommentNegativeMaskRoot } from './platform/doc-comment-storage-root.js';
+import { verifyLinuxFullIsolation, type CommentFullIsolation } from './core/doc-comment-full-isolation.js';
+import { collectSessionLineagePids } from './core/preview-port-owner.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
 import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, writeRawCommandLine } from './core/raw-command-writer.js';
@@ -2623,6 +2625,8 @@ function backendScreenEvidenceIsAuthoritativeForMutation(): boolean {
  * generation. The daemon receives this over private IPC; child-writable PID
  * marker files remain diagnostics only. */
 let currentCliCredentialIsolated = false;
+let commentFullIsolation: CommentFullIsolation | undefined;
+let commentIsolationRetries = 0;
 /** Successful remote close prepare awaiting durable daemon commit. */
 let preparedCloseRequestId: string | null = null;
 let closeRequestInFlightId: string | null = null;
@@ -18647,6 +18651,8 @@ async function spawnCli(
   queuedTurnAdvanceConsumedForPrompt = false;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
+  commentFullIsolation = undefined;
+  commentIsolationRetries = 0;
   // Enrollment writes the fixed marker before any device credential appears.
   // From that instant onward every NEW local CLI must carry a credential
   // boundary, regardless of adapter capability or optional sandbox toggles.
@@ -21830,6 +21836,22 @@ async function spawnCli(
       try { return existsSync(r.path); } catch { return false; }
     });
 
+    if (process.platform === 'linux' && !scratchRequested && ['pty','tmux'].includes(effectiveBackendType)
+      && !cfg.adoptMode) {
+      // A virtual standalone installation cannot supply a host inode proof.
+      // Withhold comment personal authority, not the ordinary Bot CLI itself.
+      try {
+        const installRoot = realpathSync(dirname(dirname(fileURLToPath(import.meta.url))));
+        const codeRoots = [installRoot];
+        try { codeRoots.push(realpathSync(join(installRoot,'node_modules'))); } catch { /* daemon verification still applies */ }
+        const authorityRoot = prepareDocCommentNegativeMaskRoot(dataDir);
+        commentFullIsolation = { mode: 'full', codeRoots: [...new Set(codeRoots)], authorityRoot };
+      } catch {
+        commentFullIsolation = undefined;
+        log('[comment-auth] host full isolation proof unavailable; personal authority withheld');
+      }
+    }
+
     if (process.platform === 'darwin') {
       if (!locateOnPath('sandbox-exec')) {
         throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
@@ -24217,6 +24239,7 @@ function killCli(opts: {
   inputDeliveryQuarantine = null;
   postTerminalInputFence = null;
   currentCliCredentialIsolated = false;
+  commentFullIsolation = undefined;
   stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();
   stopCodexRpcEngine();
@@ -27001,12 +27024,29 @@ function publishLocalProcessAttestation(
   cliPid?: number,
   enginePid = codexRpcEngine?.appServerPid,
 ): void {
+  if (commentFullIsolation && cliPid && !verifyLinuxFullIsolation(cliPid,commentFullIsolation)) {
+    const descendants=collectSessionLineagePids('/proc',[cliPid]);
+    const confined=[...(descendants??[])].find(pid=>{
+      try {return !['bwrap','sh','bash'].includes(basename(readlinkSync(`/proc/${pid}/exe`)))&&verifyLinuxFullIsolation(pid,commentFullIsolation!)}catch{return false}
+    });
+    if(confined) cliPid=confined;
+  }
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Cold fork can return the outer launcher PID before bwrap execs the CLI.
+  // Re-observe kernel confinement after launch without upgrading a stale CLI.
+  if (commentFullIsolation && cliPid && commentIsolationRetries++ < 20 && !verifyLinuxFullIsolation(cliPid,commentFullIsolation)) {
+    const generation=cliSpawnGeneration;
+    const attempt=setTimeout(()=>{if(generation===cliSpawnGeneration&&backend?.getChildPid?.()===cliPid)publishLocalProcessAttestation(cliPid);},100);
+    attempt.unref();
+  }
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
+    ...(commentFullIsolation && (cliPid || enginePid)
+      && [cliPid, enginePid].filter((pid): pid is number => !!pid).every(pid => verifyLinuxFullIsolation(pid,commentFullIsolation!))
+      ? { commentFullIsolation } : {}),
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
     ...(enginePid ? { enginePid } : {}),

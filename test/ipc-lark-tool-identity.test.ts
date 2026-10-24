@@ -19,6 +19,13 @@ import { registerDocCommentTurn, clearDocCommentTurnProvenance } from '../src/co
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+// Route tests isolate the full-kernel seam; actual mount/PID proof is executed
+// separately by doc-comment-full-isolation.integration.test.ts.
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({
+  docCommentFullIsolationVerified:(ds:any)=>ds.fixtureFull===true,
+  verifyLinuxFullIsolation:()=>true,
+  daemonCommentIsolationPaths:()=>({mode:'full',codeRoots:['fixture'],authorityRoot:'fixture'}),
+}));
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 const botToken = vi.fn<() => Promise<unknown>>();
@@ -63,12 +70,15 @@ function attestHostFixture() {
   session.worker.pid = process.pid;
   session.workerGeneration ??= 1;
   session.localProcessAttestation = { cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid),
-    workerGeneration: session.workerGeneration, backendType: 'pty', credentialIsolated: false };
+    workerGeneration: session.workerGeneration, backendType: 'pty', credentialIsolated: false,
+    commentFullIsolation: {mode:'full',codeRoots:['fixture'],authorityRoot:dir} };
   session.managedTurnOrigin.preexistingProcessIdentities = [`${process.pid}:${readProcessStartIdentity(process.pid)}`];
   delete session.managedTurnOrigin.originChannelId;
 }
 describe('session application identity route', () => {
   function commentTurn(turnId = 'reply_comment', author = 'ou_author') {
+    session.fixtureFull=true;
+    session.localProcessAttestation.commentFullIsolation={mode:'full',codeRoots:['fixture'],authorityRoot:dir};
     session.session.larkAppId = 'cli_bound';
     session.workerGeneration = session.session.workerGeneration = 1;
     const target = { fileToken: 'fixture_file', fileType: 'docx', commentId: 'fixture_comment', replyId: turnId, turnId,
@@ -93,6 +103,15 @@ describe('session application identity route', () => {
     expect((await stale('auth-status', { requestId: 'old-request' })).status).toBe(403);
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
     expect(authProvider).not.toHaveBeenCalled();
+  });
+  it.each(['off','credential-only','unproved-backend','adopt'])('withholds comment personal providers for %s while Bot replies keep working',async()=>{
+    commentTurn();session.fixtureFull=false;
+    const auth=vi.spyOn(tokens,'requestUserAuthorization').mockResolvedValue({}as any);
+    expect((await request('user')).status).toBe(403);
+    for(const route of ['auth-request','auth-status'])expect((await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/${route}`,{
+      method:'POST',headers:{'content-type':'application/json','x-botmux-lark-session':binding.accessKey},body:JSON.stringify({...originTuple(),scopes:['im:chat:read']})})).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();expect(auth).not.toHaveBeenCalled();
+    expect((await request('bot')).status).toBe(200);
   });
   it.skipIf(process.platform !== 'linux')('rejects a real preexisting background PID with the old key while allowing a fresh host request', async () => {
     commentTurn('reply_host', 'ou_host');

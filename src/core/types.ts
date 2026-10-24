@@ -144,6 +144,7 @@ export interface DaemonSession {
   localProcessAttestation?: {
     backendType: import('../adapters/backend/types.js').BackendType;
     credentialIsolated: boolean;
+    commentFullIsolation?: import('./doc-comment-full-isolation.js').CommentFullIsolation;
     cliPid?: number;
     cliProcStart?: string;
     enginePid?: number;

@@ -3,7 +3,10 @@ import { spawnSync } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+// Lifecycle seam only: actual full-only kernel/HTTP authority tests run in the
+// dedicated full-isolation integration files, never this unisolated fake Pi.
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({docCommentFullIsolationVerified:()=>true}));
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { setDefaultLocale, t } from '../src/i18n/index.js';

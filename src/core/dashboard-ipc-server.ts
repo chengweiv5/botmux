@@ -168,6 +168,7 @@ import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { verifyLinuxFullIsolation, daemonCommentIsolationPaths } from './doc-comment-full-isolation.js';
 import { readDeferredTopicBinding, writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   DEFERRED_TOPIC_CLAIM_MAX_BYTES,
@@ -3102,7 +3103,13 @@ function currentUserRequestProof(
   if (!peer.ok) return;
   const input = { sessionId: session.sessionId, peer: peer.peer, findSession: findActiveBySessionId };
   const proof = attestCurrentTurnLoopbackPeer(input);
-  return proof ? () => stillCurrent() && currentTurnPeerAttestationStable(proof, input) : undefined;
+  const comment = isDocCommentTurn(ds, origin.turnId);
+  const isolation = ds.localProcessAttestation?.commentFullIsolation;
+  const paths=comment?daemonCommentIsolationPaths():undefined;
+  if (comment && (!isolation || !paths || !verifyLinuxFullIsolation(peer.peer.pid,paths))) return;
+  return proof ? () => stillCurrent() && currentTurnPeerAttestationStable(proof, input)
+    && (!comment || !!isolation && ds.localProcessAttestation?.commentFullIsolation === isolation
+      && !!paths && verifyLinuxFullIsolation(peer.peer.pid,paths)) : undefined;
 }
 
 ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
@@ -3276,6 +3283,9 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const origin = ds?.managedTurnOrigin;
+    if (ds && origin?.turnId && isDocCommentTurn(ds,origin.turnId) && !boundTool) {
+      return jsonRes(res,403,{ok:false,error:'current_comment_actor_unverified'});
+    }
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
       || !origin?.callerOpenId || !origin.turnId || !origin.capability) {

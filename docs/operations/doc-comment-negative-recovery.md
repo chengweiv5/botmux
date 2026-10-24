@@ -31,6 +31,8 @@
 
 ## 存储隔离限制
 
+个人评论权限已增加 full-only 实际内核证明：off/credential-only/无法证明的 backend/adopt 不开放个人权限。Linux 阶段及尚未完成的 Mac 个人功能接力见 [平台范围与验收](doc-comment-platform-handoff.md)。以下存储掩蔽仍是必要条件，不能单凭掩蔽或配置 full 声称整个权限链已证明。
+
 full file sandbox强制隐藏negative全树（含SQLite sidecars、epoch和恢复audit），更深workingDir/userPaths/extraWrite不得重开，Seatbelt最后再次拒绝以覆盖write-regex。scratch/credential-only同样掩蔽该目录。不隔离配置若工作目录或明确write路径覆盖negative根，启动拒绝。PID文件不再认证管理恢复；其可删性不能绕过签名。
 
 非sandbox同UID恶意任意代码仍拥有宿主文件权限，能够直接修改存储/加载同checkout源码；拒绝路径重叠并不能隔离绝对路径，也不能保护同UID可改代码的credential-only模式。需要full sandbox（含代码完整性）或独立UID/宿主服务权限边界才能对恶意agent给出完整保证。这是阶段未闭合限制，不把本补改宣称整体安全GO。

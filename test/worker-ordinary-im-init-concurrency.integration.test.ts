@@ -32,6 +32,10 @@ afterEach(() => {
   tempDirs.clear();
 });
 
+function testHostDataDir(root:string):string {
+  const data=join(root,'host-data');mkdirSync(data,{recursive:true});return data;
+}
+
 describe('ordinary IM during real worker init', () => {
   it('queues a concurrent follow-up instead of rejecting it before cliAdapter is ready', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-init-concurrency-'));
@@ -52,7 +56,7 @@ setInterval(() => {}, 1_000);
       env: {
         ...process.env,
         HOME: root,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-worker-init-concurrency',
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
@@ -149,7 +153,7 @@ setInterval(() => {}, 1_000);
       env: {
         ...process.env,
         HOME: root,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-worker-principal-queue',
         BOTMUX_XPI_ENABLED: 'true',
         BOTMUX_TIME_SCALE: '0.05',
@@ -322,7 +326,7 @@ setInterval(() => {}, 1_000);
       env: {
         ...process.env,
         HOME: root,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-worker-principal-xpi-off',
         // The switch under test. Set explicitly so the case does not depend on
         // the ambient default staying off.
@@ -441,7 +445,7 @@ if (process.argv.includes('app-server')) {
       env: {
         ...process.env,
         HOME: root,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-worker-init-order',
         // Keep the real 7s title-metadata await that opens the race window,
         // but collapse Codex's unrelated history.jsonl submit polling so this
@@ -542,7 +546,7 @@ setInterval(() => {}, 1_000);
         HOME: root,
         XDG_DATA_HOME: xdgDataDir,
         OPENCODE_DB_PATH: join(dbDir, 'opencode.db'),
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-opencode-activation',
         // This starts a real Node process: shrinking the 2.4s confirmation
         // window to 120ms races its SQLite write, then the 20s deferred
@@ -645,7 +649,7 @@ setInterval(() => {}, 1_000);
         ...process.env,
         HOME: root,
         TRAE_HOME: traeHome,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-traex-native-title',
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',
@@ -749,7 +753,7 @@ setInterval(() => {}, 1_000);
         ...process.env,
         HOME: root,
         TRAE_HOME: traeHome,
-        SESSION_DATA_DIR: dataDir,
+        SESSION_DATA_DIR: testHostDataDir(root),
         BOTMUX_SESSION_ID: 'sid-traex-native-title-fail',
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',

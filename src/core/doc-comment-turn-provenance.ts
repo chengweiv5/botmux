@@ -3,6 +3,7 @@ import type { Session, TrustedCaller } from '../types.js';
 import { config } from '../config.js';
 import { DocCommentNegativeStore } from '../services/doc-comment-negative-store.js';
 import { logger } from '../utils/logger.js';
+import { docCommentFullIsolationVerified } from './doc-comment-full-isolation.js';
 
 interface CommentTurnRecord {
   session: Session;
@@ -93,6 +94,7 @@ export function resolveDocCommentTurnCaller(ds: DaemonSession, turnId: string): 
   const record = records.get(ds)?.get(turnId);
   const target = ds.session.docCommentTargets?.[turnId];
   if (!record || !record.authorOpenId || !/^ou_[A-Za-z0-9]+$/.test(record.authorOpenId)
+    || !docCommentFullIsolationVerified(ds)
     || !target || ds.session.status !== 'active'
     || record.session !== ds.session || record.appId !== ds.larkAppId
     || ds.session.larkAppId !== record.appId || record.sessionId !== ds.session.sessionId

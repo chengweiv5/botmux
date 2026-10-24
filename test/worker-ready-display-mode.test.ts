@@ -174,6 +174,7 @@ import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } fro
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { registerDocCommentTurn } from '../src/core/doc-comment-turn-provenance.js';
+vi.mock('../src/core/doc-comment-full-isolation.js',()=>({docCommentFullIsolationVerified:()=>true}));
 import { currentGatewayCallerOpenId } from '../src/core/worker-pool.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';

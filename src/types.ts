@@ -2147,6 +2147,7 @@ export type WorkerToDaemon =
       type: 'local_process_attestation';
       backendType: BackendType;
       credentialIsolated: boolean;
+      commentFullIsolation?: import('./core/doc-comment-full-isolation.js').CommentFullIsolation;
       cliPid?: number;
       cliProcStart?: string;
       /** RPC app-server root. Tool subprocesses are descendants of this

@@ -3,6 +3,7 @@ import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
+import { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
@@ -15249,31 +15250,6 @@ function isMeetingDrivenTurn(
   if (!ds.session.vcMeetingReceiver) return false;
   if (dispatchAttempt !== undefined) return true;
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
-}
-
-function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
-  // The daemon owns this per-turn sender map. The worker contributes only the
-  // turn id over private IPC; it can never choose which human that id denotes.
-  const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
-  if (replyTargetCaller) return replyTargetCaller;
-  const recovered = ds.session.failedTurnRecovery;
-  if (recovered?.turnId === turnId && recovered.caller.requestLarkAppId === ds.larkAppId
-      && recovered.caller.senderType === 'user') return recovered.caller.requestUserOpenId;
-  const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
-  if (scheduledCaller) {
-    // The worker publishes the same turn more than once: first at init, then
-    // again after the CLI PID attestation exists. Keep the exact-turn caller
-    // until terminal/revoke/worker-exit so the second publication cannot
-    // overwrite a correctly-bound origin with an anonymous one.
-    return scheduledCaller.requestUserOpenId;
-  }
-  const continuation = ds.session.readonlyTaskContinuation;
-  return continuation?.authorizationMode === 'inherited'
-    && continuation.currentTurnId === turnId
-    && continuation.trustedCaller?.requestLarkAppId === ds.larkAppId
-    && continuation.trustedCaller.senderType === 'user'
-    ? continuation.trustedCaller.requestUserOpenId
-    : undefined;
 }
 
 function currentTurnProcessIdentities(

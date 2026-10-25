@@ -500,6 +500,31 @@ describe('bot-config store', () => {
     expect(readConfig().noProgressNotify).toBeUndefined();
   });
 
+  it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {
+    const { store } = await loaded();
+    const noticeSpec = store.findConfigField('noProgressNotify')!;
+    const cacheSpec = store.findConfigField('promptCache')!;
+    const notice = { enabled: true, cliEnabled: true, timeoutMs: 300000 };
+    const cache = { ttl: '1h', keepalive: { enabled: true, maxPings: 2 } };
+    for (const [spec, value] of [[noticeSpec, notice], [cacheSpec, cache]] as const) {
+      const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+      expect(parsed).toEqual({ ok: true, value });
+      if (!parsed.ok) throw new Error(parsed.reason);
+      expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    }
+    expect(readConfig()).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ noProgressNotify: notice, promptCache: cache });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().promptCache).toBeUndefined();
+    expect(readConfig().noProgressNotify).toEqual(notice);
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('promptCache')!, cache)).toMatchObject({ ok: true });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('noProgressNotify')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().noProgressNotify).toBeUndefined();
+    expect(readConfig().promptCache).toEqual(cache);
+  });
+
   it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('groupCreation')!;

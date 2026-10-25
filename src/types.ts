@@ -646,6 +646,8 @@ export interface Session {
    * narrow admission group. Quarantined rows are skipped while other sessions
    * restore normally. */
   xpiSharedCwdQuarantine?: XpiSharedCwdQuarantine;
+  /** Bounded notification receipts only; never authorizes execution/replay. */
+  cliProgressNotices?: import('./services/cli-progress-notice.js').CliProgressNotice[];
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
@@ -2261,6 +2263,8 @@ export type WorkerToDaemon =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number }
+  /** Redacted execution observation for the daemon notification clock only. */
+  | { type: 'turn_progress'; turnId: string; dispatchAttempt?: number; stage: import('./services/cli-progress-notice.js').ProgressStage }
   /** Incremental model thinking (CoT) attributed to an active Lark turn.
    * `entries` is the FULL cumulative list so far (not a delta) — each entry
    * renders as its own node in the native CoT message: thinking paragraphs,

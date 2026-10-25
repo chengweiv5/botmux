@@ -874,6 +874,7 @@ import {
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
+import { recordCreatedWorktree } from './services/botmux-worktree-store.js';
 import { escapeXmlAttr, escapeXmlText } from './utils/xml.js';
 import {
   setCardDispatcher as setAskCardDispatcher,
@@ -22181,6 +22182,7 @@ async function prepareIndependentCrossPrincipalSession(
     try {
       if (await isGitWorkTree(sourceWorkingDir)) {
         const created = await createRepoWorktree(sourceWorkingDir, { slug: record.messages[0]?.text });
+        await recordCreatedWorktree(sourceDs.larkAppId, created);
         workingDir = created.path;
         isolatedWorktree = true;
         record.independentWorkingDir = workingDir;

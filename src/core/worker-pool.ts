@@ -1,3 +1,5 @@
+import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
+import { listPendingAsks } from './ask-broker.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -14940,7 +14942,7 @@ export function forkWorker(
     // Codex App no-progress nudge tuning: read live from bot config so
     // /config set noProgressNotify takes effect on the next worker fork
     // without recreating the session (same pattern as turnTimeoutMs).
-    noProgressNotify: isCodexAppCliId(agentCfg.cliId) ? botCfg.noProgressNotify : undefined,
+    noProgressNotify: isCodexAppCliId(agentCfg.cliId) || agentCfg.cliId === 'codex' ? botCfg.noProgressNotify : undefined,
     codexBrowser: botCfg.codexBrowser,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
@@ -15594,6 +15596,64 @@ function setupWorkerHandlers(
     if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
+  // Opt-in, daemon-owned watchdog: it still ticks when the CLI/model stops
+  // producing events. Never run it for App, synthetic turns or silent listeners.
+  const cliNoticeEnabled = () => ds.session.cliId === 'codex'
+    && getBot(ds.larkAppId).config.noProgressNotify?.cliEnabled === true
+    && getBot(ds.larkAppId).config.noProgressNotify?.enabled !== false;
+  // A retiring owner may only finish known cards during its bounded drain.
+  // Never adopt old records on attach, or allow this lease to survive takeover.
+  let cliNoticeExitGeneration: number | undefined;
+  const ownsCliNoticeExitCleanup = () => cliNoticeExitGeneration !== undefined
+    && ds.worker === null && ds.workerGeneration === cliNoticeExitGeneration
+    && ds.session.workerGeneration === cliNoticeExitGeneration
+    && ds.session === handlerSession && ds.session.status === 'active'
+    && ds.larkAppId === handlerLarkAppId && sessionAnchorId(ds) === handlerAnchor
+    && !isSessionTransferring(ds)
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds);
+  const cliNotices = new CliProgressNotifier({
+    records: create => ds.session.cliProgressNotices ?? (create ? (ds.session.cliProgressNotices = []) : []),
+    now: Date.now,
+    persist: () => sessionStore.updateSession(ds.session),
+    allowed: r => (ownsLifecycleMutation() || (r.settled === true && ownsCliNoticeExitCleanup())) && cliNoticeEnabled()
+      && r.generation === workerGeneration
+      && !managedAuxUiSuppressed(r.turnId, r.attempt)
+      && !isSubstituteTurn(ds, r.turnId) && !privateReplyEnabled(ds.session)
+      && !isDocNativeSession(ds),
+    waiting: () => !!ds.agentAttention || !!ds.tuiPromptCardId
+      || listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId),
+    timeout: () => getBot(ds.larkAppId).config.noProgressNotify?.timeoutMs ?? 300_000,
+    send: (r, level, beforeWrite) => scopedReply(
+      cliProgressNoticeCard(r, Date.now(), level, localeForBot(ds.larkAppId) === 'en'), 'interactive', r.turnId,
+      { replyTarget: r.target, uuid: createHash('sha256').update(`cli-stall:${ds.session.sessionId}:${r.turnId}:${r.attempt ?? ''}:${level}`)
+          .digest('hex').slice(0, 40), beforeWrite, suppressHook: true }),
+    update: async (r, id, beforeWrite) => {
+      await updateMessage(ds.larkAppId, id, cliProgressNoticeCard(r, Date.now(), r.claimed, localeForBot(ds.larkAppId) === 'en'), { beforeWrite });
+    },
+    error: () => logger.warn(`[${t}] CLI progress notice delivery/update not confirmed; no automatic repost`),
+    warn: message => logger.warn(`[${t}] ${message}`),
+  });
+  const beginCliNotice = (turnId: string, attempt?: number) => {
+    if (!ownsLifecycleMutation() || !cliNoticeEnabled() || ds.adoptedFrom || ds.session.adoptedFrom
+      || ds.session.vcMeetingReceiver || !turnId.startsWith('om_')
+      || managedAuxUiSuppressed(turnId, attempt) || isSubstituteTurn(ds, turnId)
+      || isTriggerFinalSuppressed(ds, turnId) || privateReplyEnabled(ds.session) || isDocNativeSession(ds)) return;
+    const frozen = ds.session.turnReplyContexts?.[turnId];
+    const existing = ds.session.cliProgressNotices?.find(r => r.turnId === turnId && r.attempt === attempt);
+    // Durable admission can survive reconnect, but an unproven sender cannot
+    // be replaced by the session owner or the most recent follow-up sender.
+    // If a settled record was evicted after terminal consumed the @ marker,
+    // fail closed. Frozen sender/target alone cannot prove an explicit mention.
+    if (!existing && ds.chatType !== 'p2p' && !ds.turnExplicitMentions?.has(turnId)) return;
+    const caller = existing?.caller ?? (frozen?.replyTargetSenderIsBot === false ? frozen.replyTargetSenderOpenId : undefined);
+    if (!caller || !/^ou_[a-zA-Z0-9]+$/.test(caller)) return;
+    cliNotices.begin(turnId, attempt, caller, workerGeneration, existing?.target ?? frozen?.target);
+  };
+  const cliNoticeTimer = cliNoticeEnabled() ? setInterval(() => {
+    if (!ownsLifecycleMutation()) { clearInterval(cliNoticeTimer); cliNotices.dispose(); return; }
+    void cliNotices.poll().catch(() => logger.warn(`[${t}] CLI progress notice state could not be persisted`));
+  }, 15_000) : undefined;
+  cliNoticeTimer?.unref();
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (
@@ -15948,10 +16008,16 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'turn_progress': {
+        if (!ownsLifecycleMutation() || !['model_output', 'tool_started', 'tool_returned'].includes(msg.stage)) break;
+        cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
+        break;
+      }
       case 'turn_execution_started': {
         if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
           || ds.session.workerGeneration !== workerGeneration || !msg.turnId
           || !Number.isFinite(msg.startedAtMs) || msg.startedAtMs < 0 || msg.startedAtMs > Date.now()) break;
+        beginCliNotice(msg.turnId, msg.dispatchAttempt);
         const starts = ds.replyExecutionStarts ??= new Map();
         const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
         starts.delete(key);
@@ -16885,6 +16951,7 @@ function setupWorkerHandlers(
 
       case 'thinking_superseded': {
         if (!ownsLifecycleMutation()) break;
+        cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         if (msg.sessionId !== ds.session.sessionId) break;
         handleCotThinkingSuperseded(ds, msg);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
@@ -18318,6 +18385,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored explicit_reply_observed from stale worker generation`);
           break;
         }
+        if (ownsLifecycleMutation() && msg.messageId) cliNotices.reply(msg.turnId, msg.responseKind === 'final');
         if (msg.messageId && msg.terminalCarrier) {
           recordTurnTerminalCarrier(ds, msg.turnId, {
             messageId: msg.messageId,
@@ -18578,6 +18646,7 @@ function setupWorkerHandlers(
             + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
           );
         }
+        if (ownsLifecycleMutation()) cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         forgetScheduledTurnCaller(ds, msg.turnId);
         // Mark the turn terminal for identity-decision replay gating (bounded;
         // the generation gate above makes stale-worker terminals harmless).
@@ -19885,6 +19954,13 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    clearInterval(cliNoticeTimer);
+    if (ownsLifecycleMutation()) {
+      cliNoticeExitGeneration = workerGeneration + 1;
+      // Do not await in the exit handler: dead IPC/lifecycle fencing below must
+      // happen immediately. close() drains only PATCH, for at most two seconds.
+      void cliNotices.close().catch(() => logger.warn(`[${t}] CLI progress exit cleanup not confirmed`));
+    } else cliNotices.dispose();
     const transferRetirement = transferRetiringWorkers.has(worker);
     const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
     const unexpectedWorkerExit = !transferRetirement

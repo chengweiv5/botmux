@@ -1929,6 +1929,7 @@ const registerMcpLinkRefsThroughHost: GatewayLinkRefRegistrationHandler = async 
 async function resolveMcpLinkRefsThroughHost(input: {
   identity: NonNullable<ReturnType<typeof currentGatewayTrustedTurnIdentity>>;
   payload: import('./services/link-ref-resolver.js').OutboundLinkRefPayload;
+  responseKind: 'final' | 'auxiliary';
 }): Promise<import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs> {
   if (!input.identity.turnId || input.identity.linkRefMode !== 'enabled') {
     return { ...input.payload, refCount: 0 };
@@ -1947,6 +1948,7 @@ async function resolveMcpLinkRefsThroughHost(input: {
       ? { dispatchAttempt: input.identity.dispatchAttempt }
       : {}),
     linkRefMode: 'enabled',
+    responseKind: input.responseKind,
     payload: input.payload,
   });
   try {
@@ -1967,7 +1969,11 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
   const resolvedDelivery = await resolveTrustedResultDeliveryLinkRefs({
     delivery,
     mode: identity.linkRefMode ?? 'disabled',
-    resolve: payload => resolveMcpLinkRefsThroughHost({ identity, payload }),
+    resolve: (payload, responseKind) => resolveMcpLinkRefsThroughHost({
+      identity,
+      payload,
+      responseKind,
+    }),
     persist: value => {
       artifact = artifactStore.create({
         pluginId: input.pluginId,
@@ -7034,6 +7040,13 @@ function cotEntryWithoutSentinel(entry: CotEntry): CotEntry | null {
 
 function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string; dispatchAttempt?: number }): void {
   if (entries.length === 0) return;
+  // Independent of the capped/display-only CoT buffer. No text, args or results
+  // leave this signal; terminal spinners and process heartbeats never count.
+  if (lastInitConfig?.cliId === 'codex' && lastInitConfig.noProgressNotify?.cliEnabled === true) {
+    const last = entries[entries.length - 1];
+    send({ type: 'turn_progress', ...turn, stage: last.kind === 'tool_call' ? 'tool_started'
+      : last.kind === 'tool_result' ? 'tool_returned' : 'model_output' });
+  }
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn

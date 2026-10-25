@@ -18,6 +18,8 @@ export function currentGatewayCallerOpenId(
   if (replyTargetCaller) return replyTargetCaller;
   // Document turns have their own reply-target registry, populated before
   // worker delivery. Never borrow the subscription/session owner or a later turn.
+  // The daemon writes it in this app's session; credential routes still verify
+  // the resolved identity is a real user before reading that user's token.
   const commentTarget = ds.session.docCommentTargets?.[turnId];
   if (commentTarget?.turnId === turnId && commentTarget.replyToOpenId) {
     return commentTarget.replyToOpenId;

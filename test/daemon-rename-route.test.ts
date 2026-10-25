@@ -3789,6 +3789,52 @@ describe('document comment canonical ownership and single-flight delivery', () =
     putDocSubscription(config.session.dataDir, APP, sub);
   }
 
+  it.each([
+    { name: 'author', authorOpenId: OWNER, adopt: false },
+    { name: 'unknown author', authorOpenId: undefined, adopt: false },
+    { name: 'adopted input', authorOpenId: OWNER, adopt: true },
+  ])('delivers the live comment execution identity through worker IPC: $name', async ({ authorOpenId, adopt }) => {
+    const sub = docSub(`doc-live-caller-${adopt}-${authorOpenId ?? 'unknown'}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'live comment identity');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    if (adopt) ds.adoptedFrom = { session: 'legacy-native' } as any;
+    bindSubToSession(sub, ds);
+    try {
+      await expect(handleDocComment({ ...docCtx(sub, 'live-caller'), authorOpenId })).resolves.toBe(true);
+      const messages = send.mock.calls.map(call => call[0]).filter(message => message.type === 'message');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ turnId: 'reply-live-caller', content: expect.stringContaining('question live-caller') });
+      if (authorOpenId && !adopt) {
+        expect(messages[0].trustedCaller).toEqual({ requestLarkAppId: APP, requestUserOpenId: authorOpenId, senderType: 'user' });
+      } else {
+        expect(messages[0]).not.toHaveProperty('trustedCaller');
+      }
+    } finally {
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    }
+  });
+
+  it('keeps each live comment IPC identity tied to its own author and turn', async () => {
+    const sub = docSub('doc-live-caller-switch');
+    const ds = seedThreadSession(sub.sessionAnchor, 'live comment author switch');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    try {
+      for (const [suffix, authorOpenId] of [['a', OWNER], ['b', 'ou_second_author']]) {
+        await expect(handleDocComment({ ...docCtx(sub, `caller-${suffix}`), authorOpenId })).resolves.toBe(true);
+      }
+      const messages = send.mock.calls.map(call => call[0]).filter(message => message.type === 'message');
+      expect(messages.map(message => ({ turnId: message.turnId, caller: message.trustedCaller }))).toEqual([
+        { turnId: 'reply-caller-a', caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' } },
+        { turnId: 'reply-caller-b', caller: { requestLarkAppId: APP, requestUserOpenId: 'ou_second_author', senderType: 'user' } },
+      ]);
+    } finally {
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    }
+  });
+
   it('leaves the provider cursor retryable when a worker-null setup owner exists', async () => {
     const sub = docSub(`doc-protected-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'protected doc owner');

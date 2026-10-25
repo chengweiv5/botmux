@@ -17,6 +17,38 @@ function comment(turnId: string, replyToOpenId?: string) {
 }
 
 describe('currentGatewayCallerOpenId', () => {
+  it('preserves an explicit callerless execution even with a recorded comment author', () => {
+    const ds = { ...session({ docCommentTargets: { A: comment('A', 'ou_comment') } }),
+      managedTurnOrigin: { turnId: 'A', capability: 'cap', trustedCaller: null },
+    };
+    expect(currentGatewayCallerOpenId(ds, 'A')).toBeUndefined();
+  });
+
+  it('preserves the active execution caller instead of the newer comment envelope author', () => {
+    const ds = { ...session({ docCommentTargets: { B: comment('B', 'ou_comment_b') } }),
+      managedTurnOrigin: { turnId: 'B', capability: 'cap', callerOpenId: 'ou_execution_a',
+        trustedCaller: { requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_execution_a', senderType: 'user' as const } },
+    };
+    expect(currentGatewayCallerOpenId(ds, 'B')).toBe('ou_execution_a');
+  });
+
+  it('does not recover a comment author when an explicit principal lacks a caller id', () => {
+    const ds = { ...session({ docCommentTargets: { A: comment('A', 'ou_comment') } }),
+      managedTurnOrigin: { turnId: 'A', capability: 'cap',
+        trustedCaller: { requestLarkAppId: 'cli_target', senderType: 'user' as const } },
+    };
+    expect(currentGatewayCallerOpenId(ds, 'A')).toBeUndefined();
+  });
+
+  it('recovers exact comment authors only when the origin is older or belongs to another turn', () => {
+    const ds = { ...session({ docCommentTargets: { A: comment('A', 'ou_comment') } }),
+      managedTurnOrigin: { turnId: 'A', capability: 'cap' } as DaemonSession['managedTurnOrigin'],
+    };
+    expect(currentGatewayCallerOpenId(ds, 'A')).toBe('ou_comment');
+    ds.managedTurnOrigin = { turnId: 'B', capability: 'cap', trustedCaller: null };
+    expect(currentGatewayCallerOpenId(ds, 'A')).toBe('ou_comment');
+  });
+
   it('resolves each comment author without borrowing a queued later turn', () => {
     const ds = session({ docCommentTargets: {
       A: comment('A', 'ou_author_a'), B: comment('B', 'ou_author_b'),

@@ -4,9 +4,16 @@ import { pickTurnReplyTarget } from './reply-target.js';
 /** Resolve the requesting user from daemon-owned records for one exact turn.
  * The worker supplies only the turn id, never a user or a session-owner fallback. */
 export function currentGatewayCallerOpenId(
-  ds: Pick<DaemonSession, 'session' | 'larkAppId' | 'scheduledTurnCallers'>,
+  ds: Pick<DaemonSession, 'session' | 'larkAppId' | 'scheduledTurnCallers' | 'managedTurnOrigin'>,
   turnId: string,
 ): string | undefined {
+  const origin = ds.managedTurnOrigin;
+  if (origin?.turnId === turnId) {
+    // Preserve the upstream execution principal, including explicit callerless
+    // turns. Only older workers without this field may recover from registries.
+    if (origin.trustedCaller === null) return undefined;
+    if (origin.trustedCaller !== undefined) return origin.callerOpenId;
+  }
   const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
   // Document turns have their own reply-target registry, populated before

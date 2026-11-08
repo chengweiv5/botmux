@@ -17,6 +17,7 @@ import { delay } from '../../utils/timing.js';
 import { logger } from '../../utils/logger.js';
 import { drainPiTranscript, findPiTranscriptBySessionId, findPiTranscriptByPid, piBotmuxSessionTranscript } from '../../services/pi-transcript.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { loadPiModelCatalog } from '../../services/pi-model-catalog.js';
 
 /** botmux ships its built-in skills for Pi here and injects it per-session via
  *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
@@ -158,8 +159,9 @@ export function buildPiArgs(opts: {
 export function resolvePiModelForSpawn(
   model: string | undefined,
   childEnv: NodeJS.ProcessEnv,
+  workingDir?: string,
 ): string | undefined {
-  const resolution = resolvePiModel(model, { env: childEnv });
+  const resolution = resolvePiModel(model, { env: childEnv, cwd: workingDir });
   switch (resolution.kind) {
     case 'none':
       return undefined;
@@ -335,6 +337,7 @@ export function createPiAdapter(
     // (piSandboxSessionDir).
     authPaths: ['~/.pi/agent'],
     resolvedBin: bin,
+    detectModels: (options) => loadPiModelCatalog({ cliBin: bin, env: options?.env, cwd: options?.cwd }),
 
     buildArgs({
       sessionId,
@@ -395,7 +398,7 @@ export function createPiAdapter(
 
       // Resolve against the child env (per-bot env wins over daemon env), the
       // same env pi sees, so an agent-dir overlay / HOME redirect is honored.
-      const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env });
+      const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env }, workingDir);
 
       return buildPiArgs({
         sessionId,

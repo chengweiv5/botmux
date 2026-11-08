@@ -19,6 +19,7 @@ import {
 } from './session-env.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
 import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
+import { protectedMcpRedactedEnvKeys, type ProtectedMcpWorkerPolicy } from './protected-mcp-capabilities.js';
 
 /** The bot-config fields the overlay depends on. */
 export interface SessionEnvBotInput {
@@ -139,6 +140,30 @@ export function botOneShotProbeEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotIn
 
 export function botOneShotEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): NodeJS.ProcessEnv {
   return botOneShotProbeEnv(base, bot).env;
+}
+
+/** Read a session's configured CLI environment, not the unwrapped Bot-default
+ * probe environment. Identity wrappers are not run and protected sources stay
+ * unavailable; the same launch facts still govern which overlay keys apply. */
+export function sessionOneShotProbeEnv(
+  base: NodeJS.ProcessEnv,
+  input: Parameters<typeof resolveSessionEnv>[0],
+  protectedPolicy?: ProtectedMcpWorkerPolicy,
+): { env: NodeJS.ProcessEnv; fingerprint: string } {
+  const resolved = resolveSessionEnv(input);
+  const protectedKeys = new Set(protectedMcpRedactedEnvKeys(protectedPolicy));
+  const composed = {
+    set: Object.fromEntries(Object.entries(resolved.composed.set).filter(([key]) => !protectedKeys.has(key))),
+    unset: resolved.composed.unset.filter(key => !protectedKeys.has(key)),
+  };
+  return {
+    env: {
+      ...buildSessionChildEnv(buildBotWorkerEnv(base, input.bot.envPolicy, protectedPolicy),
+        input.bot.envPolicy, composed.unset, protectedPolicy),
+      ...botInjectedEnv(composed.set, input.bot.envPolicy, protectedPolicy),
+    },
+    fingerprint: sessionEnvFingerprint(composed, input.bot.envPolicy),
+  };
 }
 
 /**

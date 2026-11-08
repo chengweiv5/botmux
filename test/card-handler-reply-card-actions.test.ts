@@ -10,6 +10,17 @@
  * Mock surface follows card-handler-stop-compact.test.ts.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as childProcess from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resolveCliRuntime } from '../src/adapters/cli/runtime.js';
+import { config } from '../src/config.js';
+
+vi.mock('node:child_process', async importOriginal => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
+  execFile: vi.fn(),
+}));
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(),
@@ -28,7 +39,8 @@ vi.mock('../src/platform/binding.js', () => ({
   platformTerminalBaseUrl: () => platformTerminalBaseUrlMock(),
 }));
 
-vi.mock('../src/bot-registry.js', () => ({
+vi.mock('../src/bot-registry.js', async importOriginal => ({
+  effectiveDefaultWorkingDir: (await importOriginal<typeof import('../src/bot-registry.js')>()).effectiveDefaultWorkingDir,
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
@@ -151,11 +163,13 @@ vi.mock('../src/services/local-cli-opener.js', () => ({
 }));
 
 const remoteAccessEnabledMock = vi.fn(() => false);
+const globalSessionEnvMock = vi.fn(() => undefined as any);
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: vi.fn(() => ({})),
   isRemoteAccessEnabled: () => remoteAccessEnabledMock(),
   // Model probes compose the session env overlay (no global layer here).
-  readRawGlobalSessionEnv: () => undefined,
+  readRawGlobalSessionEnv: () => globalSessionEnvMock(),
+  configuredProtectedMcpEnvKeys: () => [],
 }));
 
 const staticModelChoicesMock = vi.fn(() => ['fable', 'opus', 'sonnet', 'haiku']);
@@ -164,16 +178,16 @@ const readTraexModelLoadsMock = vi.fn(async (..._args: any[]) => null as Map<str
 vi.mock('../src/services/traex-model-load.js', () => ({
   readTraexModelLoads: (...args: any[]) => readTraexModelLoadsMock(...args),
 }));
-vi.mock('../src/services/model-catalog.js', () => ({
+vi.mock('../src/services/model-catalog.js', async importOriginal => ({
   staticModelChoices: (...args: any[]) => staticModelChoicesMock(...args),
   detectModels: (...args: any[]) => detectModelsMock(...args),
   // Mirror the real helper: a non-empty live catalogue wins; static is only
   // the fallback when live probing returns null/empty.
   mergeModelChoices: (stat: string[], live: string[] | null) => ({ models: live && live.length ? [...live] : [...stat] }),
-  runtimeExecutableForBotSelection: () => undefined,
+  runtimeExecutableForBotSelection: (await importOriginal<typeof import('../src/services/model-catalog.js')>()).runtimeExecutableForBotSelection,
 }));
 
-import { buildDefaultModelPickerCard, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
+import { buildDefaultModelPickerCard, defaultModelPickerData, sessionModelPickerData, showSessionModelPicker } from '../src/im/lark/session-model-picker.js';
 import { handleCommand } from '../src/core/command-handler.js';
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { setTerminalProxyPort, resetTerminalProxy } from '../src/core/terminal-url.js';
@@ -270,6 +284,7 @@ function enableMenu(cliId = 'claude-code') {
 }
 
 beforeEach(() => {
+  globalSessionEnvMock.mockReset().mockReturnValue(undefined);
   writeSessionModelPinMock.mockReset().mockImplementation((ds: any, pin: any) => { ds.session.modelPin = pin; return true; });
   topicReasoningControlMock.mockReset().mockReturnValue(undefined);
   setTopicReasoningEffortMock.mockReset().mockReturnValue('saved');
@@ -516,6 +531,342 @@ describe('reply_model_pick action', () => {
 });
 
 describe('/models shortcut', () => {
+  it.each([
+    ...(['pi', 'claude-code'] as const).flatMap(botCli =>
+      (['pty', 'tmux'] as const).flatMap(backendType => ['legacy', 'frozen', 'snapshot', 'binding'].map(state =>
+        ({ botCli, backendType, state, daemonBackend: 'pty' as const, envMode: 'bot', stamped: true })))),
+    ...(['remote-runner', 'riff', 'mojo'] as const).flatMap(backendType =>
+      (['pty', 'tmux', 'riff'] as const).flatMap(daemonBackend =>
+        ['legacy', 'frozen', 'snapshot', 'binding'].filter(state => state !== 'snapshot' || backendType !== 'riff').flatMap(state =>
+          ['bot', 'global', 'strict'].map(envMode =>
+            ({ botCli: backendType, backendType, state, daemonBackend, envMode, stamped: false }))))),
+  ])('matches effective cross-CLI launch sources in menus and both picks ($botCli, $backendType, $state, $daemonBackend, $envMode)', async ({ botCli, backendType, state, daemonBackend, envMode, stamped }) => {
+    const priorBackend = config.daemon.backendType;
+    config.daemon.backendType = daemonBackend;
+    const root = mkdtempSync(join(tmpdir(), 'pi-cross-picker-'));
+    const ownBin = join(root, 'session-pi'), currentBin = join(root, 'current-pi');
+    const globalAgent = join(root, 'global-agent'), botAgent = join(root, 'bot-agent');
+    for (const [agent, provider] of [[globalAgent, 'global-source'], [botAgent, 'bot-source']]) {
+      mkdirSync(agent!);
+      writeFileSync(join(agent!, 'models.json'), JSON.stringify({ providers: {
+        [provider!]: { api: 'openai-completions', apiKey: '!do-not-run-helper', headers: { Authorization: 'synthetic-header' },
+          baseUrl: 'http://127.0.0.1:1', models: [{ id: 'shared' }, { id: 'unique-id' }] },
+      } }));
+      writeFileSync(join(agent!, 'settings.json'), '{"doNotCopy":"synthetic-setting"}');
+    }
+    const observed: Array<{ bin: string; env: any; mirror: string }> = [];
+    const fakeExec = vi.mocked(childProcess.execFile).mockImplementation(((bin: string, _args: string[], opts: any, cb: Function) => {
+      const mirror = readFileSync(join(opts.cwd, 'models.json'), 'utf8');
+      observed.push({ bin, env: opts.env, mirror });
+      const rows = bin === currentBin ? ['current-source shared 128K 16K no no'] : Object.entries(JSON.parse(mirror).providers)
+        .flatMap(([provider, value]: [string, any]) => value.models.map((model: any) => `${provider} ${model.id} 128K 16K no no`));
+      cb(null, { stdout: ['provider model context max-out thinking images', ...rows].join('\n'), stderr: '' });
+    }) as typeof childProcess.execFile);
+    try {
+      const { createModelCatalog } = await vi.importActual<typeof import('../src/services/model-catalog.js')>('../src/services/model-catalog.js');
+      const catalogue = createModelCatalog();
+      detectModelsMock.mockImplementation((key: string, opts: any) => catalogue.detectModels(key, opts));
+      globalSessionEnvMock.mockReturnValue({ set: { PI_CODING_AGENT_DIR: globalAgent }, unset: ['GLOBAL_REMOVED'] });
+      enableMenu(botCli);
+      const bot = getBot(LARK_APP_ID) as any;
+      Object.assign(bot.config, { backendType, cliPathOverride: botCli === 'pi' ? currentBin : undefined,
+        env: state === 'snapshot' || envMode === 'global' ? undefined : { PI_CODING_AGENT_DIR: botAgent, OPENAI_API_KEY: 'synthetic-raw-token',
+          NODE_OPTIONS: '--require /synthetic/loader', GOOGLE_APPLICATION_CREDENTIALS: '/synthetic/adc', ZDOTDIR: '/synthetic/wrong-shell' },
+        envUnset: ['BOT_REMOVED'], envPolicy: envMode === 'strict' ? { mode: 'strict' } : undefined });
+      bot.resolvedAllowedUsers = [OWNER];
+      const runtime = resolveCliRuntime({ cliId: 'pi', cliPathOverride: ownBin });
+      const shape = { workingDir: root, sessionOverrides: { cliId: 'pi', backendType: stamped ? backendType : undefined, workingDir: root,
+        agentFrozen: state !== 'legacy', cliPathOverride: ownBin, cliRuntime: state === 'legacy' ? undefined : runtime,
+        ...(state === 'snapshot' ? { cliLaunchSnapshot: { state: 'resolved', cliId: 'pi', cliRuntime: runtime, cliPathOverride: ownBin } } : {}),
+        ...(state === 'binding' ? { cliInstanceBinding: { instanceId: 'synthetic' } } : {}),
+      } } as any;
+      const expectedSource = state === 'snapshot' || state === 'binding' || envMode === 'global' ? 'global-source' : 'bot-source';
+      const expected = [`${expectedSource}/shared`, `${expectedSource}/unique-id`];
+      const ds = makeDs(shape), before = JSON.stringify(ds.session);
+      const options = (card: string) => JSON.parse(card).elements.find((el: any) => el.tag === 'action').actions[0].options.map((o: any) => o.value);
+      const deps = depsWith(ds, vi.fn(() => true));
+      expect((await sessionModelPickerData(ds)).models).toEqual(expected);
+      await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+      expect(options(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2])).toEqual(expected);
+      const menu = await handleCardAction(menuData('model'), deps, LARK_APP_ID);
+      await menu.afterAck();
+      expect(options(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2])).toEqual(expected);
+      expect(JSON.stringify(ds.session)).toBe(before);
+      const top = depsWith(ds); top.invocationContext = 'new-topic';
+      const priorCalls = detectModelsMock.mock.calls.length;
+      await handleCommand('/models', ROOT, { messageId: 'om_default', senderId: OWNER, content: '/models' } as any, top, LARK_APP_ID);
+      if (stamped) {
+        expect(options(top.sessionReply.mock.calls[0][1])).toEqual(botCli === 'pi'
+          ? ['__unset__', 'current-source/shared'] : ['__unset__', ...staticModelChoicesMock()]);
+      } else {
+        expect(top.sessionReply).toHaveBeenCalled();
+        expect((await defaultModelPickerData(LARK_APP_ID)).models).toEqual(staticModelChoicesMock());
+        expect(detectModelsMock.mock.calls.length).toBe(priorCalls);
+      }
+      for (const action of ['session_model_pick', 'reply_model_pick']) {
+        const chosen = makeDs(shape), delivery = vi.fn(() => true), submit = depsWith(chosen, delivery);
+        const prior = JSON.stringify(chosen.session);
+        for (const wrongSource of ['current-source', expectedSource === 'global-source' ? 'bot-source' : 'global-source']) {
+          const wrong = pickData(`${wrongSource}/shared`); wrong.action.value.action = action;
+          expect((await handleCardAction(wrong, submit, LARK_APP_ID)).toast.type).toBe('warning');
+        }
+        expect(JSON.stringify(chosen.session)).toBe(prior);
+        expect(delivery).not.toHaveBeenCalled();
+        const right = pickData(`${expectedSource}/shared`); right.action.value.action = action;
+        expect((await handleCardAction(right, submit, LARK_APP_ID)).toast.type).toBe('success');
+        expect(delivery.mock.calls[0][1]).toBe(`/model ${expectedSource}/shared`);
+        expect(chosen.session.modelPin?.model).toBe(`${expectedSource}/shared`);
+      }
+      expect(observed.some(entry => entry.bin === ownBin)).toBe(true);
+      for (const [, opts] of detectModelsMock.mock.calls.filter(([, opts]) => opts.runtimeExecutable === ownBin)) {
+        expect(opts.probeEnv.ZDOTDIR).toBeUndefined();
+        expect(opts.probeEnv.BOT_REMOVED).toBeUndefined();
+        expect(opts.probeEnv.GLOBAL_REMOVED).toBeUndefined();
+      }
+      for (const entry of observed) {
+        const exposed = JSON.stringify(entry);
+        for (const secret of ['synthetic-raw-token', 'synthetic-header', '!do-not-run-helper', 'synthetic-setting',
+          botAgent, globalAgent, '/synthetic/adc', '/synthetic/loader']) expect(exposed).not.toContain(secret);
+        expect(entry.env.NODE_OPTIONS).toBeUndefined();
+        expect(entry.env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
+      }
+    } finally {
+      config.daemon.backendType = priorBackend;
+      fakeExec.mockReset();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each((['pi', 'claude-code'] as const).flatMap(botCli =>
+    (['pty', 'tmux'] as const).flatMap(backendType => [false, true].map(snapshot => ({ botCli, backendType, snapshot }))),
+  ))('uses frozen Pi editions for menus, both picks and cache ($botCli, $backendType, $snapshot)', async ({ botCli, backendType, snapshot }) => {
+    const root = mkdtempSync(join(tmpdir(), 'pi-frozen-picker-'));
+    const frozenBin = join(root, 'old-pi'), updatedBin = join(root, 'current-pi');
+    const oldPath = process.env.PATH;
+    for (const bin of [frozenBin, updatedBin, join(root, 'pi')]) {
+      writeFileSync(bin, '#!/bin/sh\nexit 0\n');
+      chmodSync(bin, 0o700);
+    }
+    process.env.PATH = `${root}:${oldPath}`;
+    const seen: string[] = [];
+    const fakeExec = vi.mocked(childProcess.execFile).mockImplementation(((bin: string, _args: string[], _opts: any, cb: Function) => {
+      seen.push(bin);
+      const provider = bin === frozenBin ? 'frozen' : bin === updatedBin ? 'updated' : 'stock';
+      cb(null, { stdout: `provider model context max-out thinking images\n${provider} unique-id 128K 16K no no\n`, stderr: '' });
+    }) as typeof childProcess.execFile);
+    try {
+      const { createModelCatalog } = await vi.importActual<typeof import('../src/services/model-catalog.js')>('../src/services/model-catalog.js');
+      const catalogue = createModelCatalog();
+      detectModelsMock.mockImplementation((key: string, opts: any) => catalogue.detectModels(key, opts));
+      enableMenu(botCli);
+      const bot = getBot(LARK_APP_ID) as any;
+      Object.assign(bot.config, { backendType, cliPathOverride: botCli === 'pi' ? updatedBin : undefined });
+      bot.resolvedAllowedUsers = [OWNER];
+      const frozenRuntime = resolveCliRuntime({ cliId: 'pi', cliPathOverride: frozenBin });
+      const sessionOverrides = {
+        cliId: 'pi', backendType, agentFrozen: true, cliPathOverride: frozenBin, cliRuntime: frozenRuntime,
+        ...(snapshot ? { cliLaunchSnapshot: { version: 1, state: 'resolved', entryId: 'pi', cliId: 'pi',
+          cliRuntime: frozenRuntime, cliPathOverride: frozenBin, startupCommands: [] } } : {}),
+      } as any;
+      const ds = makeDs({ sessionOverrides });
+      const before = JSON.stringify(ds.session);
+      const options = (card: string) => JSON.parse(card).elements.find((el: any) => el.tag === 'action').actions[0].options.map((o: any) => o.value);
+      const deps = depsWith(ds, vi.fn(() => true));
+      await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+      expect(options(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2])).toEqual(['frozen/unique-id']);
+      const menu = await handleCardAction(menuData('model'), deps, LARK_APP_ID);
+      await menu.afterAck();
+      expect(options(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2])).toEqual(['frozen/unique-id']);
+      expect(JSON.stringify(ds.session), 'read-only menu').toBe(before);
+      const top = depsWith(ds);
+      top.invocationContext = 'new-topic';
+      await handleCommand('/models', ROOT, { messageId: 'om_default', senderId: OWNER, content: '/models' } as any, top, LARK_APP_ID);
+      expect(options(top.sessionReply.mock.calls[0][1])).toEqual(botCli === 'pi'
+        ? ['__unset__', 'updated/unique-id'] : ['__unset__', ...staticModelChoicesMock()]);
+      for (const action of ['reply_model_pick', 'session_model_pick']) {
+        const chosen = makeDs({ sessionOverrides });
+        const delivery = vi.fn(() => true);
+        const submit = depsWith(chosen, delivery);
+        const beforeSubmit = JSON.stringify(chosen.session);
+        for (const model of ['updated/unique-id', 'stock/unique-id']) {
+          const wrong = pickData(model);
+          wrong.action.value.action = action;
+          expect((await handleCardAction(wrong, submit, LARK_APP_ID)).toast.type).toBe('warning');
+        }
+        expect(JSON.stringify(chosen.session)).toBe(beforeSubmit);
+        expect(delivery).not.toHaveBeenCalled();
+        const frozen = pickData('frozen/unique-id');
+        frozen.action.value.action = action;
+        expect((await handleCardAction(frozen, submit, LARK_APP_ID)).toast.type).toBe('success');
+        expect(delivery.mock.calls[0][1]).toBe('/model frozen/unique-id');
+        expect(chosen.session.modelPin?.model).toBe('frozen/unique-id');
+      }
+      const other = makeDs({ sessionOverrides: { cliId: 'pi', backendType, agentFrozen: true,
+        cliRuntime: resolveCliRuntime({ cliId: 'pi', cliPathOverride: updatedBin }) } });
+      expect((await sessionModelPickerData(other)).models).toEqual(['updated/unique-id']);
+      expect((await sessionModelPickerData(ds)).models).toEqual(['frozen/unique-id']);
+      expect(seen).toContain(frozenBin);
+      expect(seen).not.toContain(join(root, 'pi'));
+    } finally {
+      fakeExec.mockReset();
+      process.env.PATH = oldPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['pty', 'tmux', 'remote-runner', 'riff', 'mojo'] as const)('uses the same frozen TraeX edition for catalogue and load (%s)', async backendType => {
+    enableMenu('claude-code');
+    (getBot(LARK_APP_ID).config as any).backendType = backendType;
+    globalSessionEnvMock.mockReturnValue({ set: { PI_CODING_AGENT_DIR: '/synthetic/global-dir', ZDOTDIR: '/synthetic/wrong-shell' } });
+    detectModelsMock.mockImplementation((_key: string, opts: any) => Promise.resolve(
+      opts.runtimeExecutable === '/tmp/old-traex' ? ['frozen-model'] : ['updated-model']));
+    readTraexModelLoadsMock.mockImplementation((opts: any) => Promise.resolve(new Map([
+      [opts.cliBin === '/tmp/old-traex' ? 'frozen-model' : 'updated-model', 19],
+    ])));
+    const ds = makeDs({ sessionOverrides: { cliId: 'traex', agentFrozen: true,
+      cliRuntime: resolveCliRuntime({ cliId: 'traex', cliPathOverride: '/tmp/old-traex' }), cliPathOverride: '/tmp/stale-traex' } });
+    const data = await sessionModelPickerData(ds);
+    expect(data.models).toEqual(['frozen-model']);
+    expect(data.load.loads?.get('frozen-model')).toBe(19);
+    expect(readTraexModelLoadsMock.mock.calls[0][0].env.PI_CODING_AGENT_DIR).toBe('/synthetic/global-dir');
+    expect(readTraexModelLoadsMock.mock.calls[0][0].env.ZDOTDIR).toBeUndefined();
+    const deliver = vi.fn(() => true);
+    const deps = depsWith(ds, deliver);
+    expect((await handleCardAction(pickData('updated-model'), deps, LARK_APP_ID)).toast.type).toBe('warning');
+    expect((await handleCardAction(pickData('frozen-model'), deps, LARK_APP_ID)).toast.type).toBe('success');
+    expect(deliver.mock.calls[0][1]).toBe('/model frozen-model');
+  });
+
+  it.each(['remote-runner', 'unknown-wrapper', 'snapshot-inconsistent'])(
+    'does not run discovery or load for unavailable frozen shapes (%s)', async mode => {
+      enableMenu('traex');
+      const ds = makeDs({ ...(mode === 'remote-runner' ? { initConfig: { backendType: 'remote-runner' } } : {}),
+        sessionOverrides: { cliId: 'traex', agentFrozen: true,
+        ...(mode === 'unknown-wrapper' ? { wrapperCli: 'unregistered' } : {}),
+        ...(mode === 'snapshot-inconsistent' ? { cliLaunchSnapshot: { state: 'resolved', cliId: 'traex',
+          cliRuntime: resolveCliRuntime({ cliId: 'traex', cliPathOverride: '/tmp/old-traex' }), cliPathOverride: null } } : {}),
+      } as any });
+      const before = JSON.stringify(ds.session);
+      await sessionModelPickerData(ds);
+      expect(detectModelsMock).not.toHaveBeenCalled();
+      expect(readTraexModelLoadsMock).not.toHaveBeenCalled();
+      expect(JSON.stringify(ds.session)).toBe(before);
+    },
+  );
+
+  it.each(['pending', 'resolved'])('uses the selected shape over legacy wrapper fields (%s)', async state => {
+    enableMenu('claude-code');
+    detectModelsMock.mockResolvedValue(['selected/model']);
+    const ds = makeDs({ sessionOverrides: { cliId: 'codex', wrapperCli: 'ttadk-codex',
+      cliLaunchSnapshot: { state, cliId: 'pi', cliRuntime: null, cliPathOverride: null, wrapperCli: null, cliLaunchMode: null } } as any });
+    const before = JSON.stringify(ds.session);
+    expect((await sessionModelPickerData(ds)).models).toEqual(['selected/model']);
+    expect(detectModelsMock).toHaveBeenCalledWith('pi', expect.objectContaining({ runtimeExecutable: undefined }));
+    expect(JSON.stringify(ds.session)).toBe(before);
+  });
+
+  it.each((['pty', 'tmux'] as const).flatMap(backendType =>
+    (['explicit', 'unpersisted HOME', 'live differs', 'cold persisted', 'Bot fallback'] as const).map(mode => ({ backendType, mode })),
+  ))('uses effective launch cwd for Pi menus and both submissions ($backendType, $mode)', async ({ backendType, mode }) => {
+    const root = mkdtempSync(join(tmpdir(), 'pi-card-picker-cwd-'));
+    const daemonCwd = join(root, 'daemon'), botCwd = join(root, 'bot'), sessionCwd = join(root, 'session');
+    const storedCwd = join(root, 'stored'), injectedHome = join(root, 'injected-home'), home = homedir();
+    const directories = [[daemonCwd, 'daemon-provider'], [botCwd, 'bot-provider'], [sessionCwd, 'session-provider'],
+      [storedCwd, 'stored-provider'], [injectedHome, 'injected-provider'], [home, 'home-provider']];
+    for (const [cwd, provider] of directories) {
+      mkdirSync(join(cwd!, 'relative-agent'), { recursive: true });
+      writeFileSync(join(cwd!, 'relative-agent', 'models.json'), JSON.stringify({ providers: {
+        [provider!]: { api: 'openai-completions', baseUrl: 'http://127.0.0.1:1', models: [{ id: 'shared' }] },
+      } }));
+    }
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(daemonCwd);
+    const execSpy = vi.mocked(childProcess.execFile).mockImplementation(((_bin: string, _args: string[], opts: any, cb: Function) => {
+      const { providers } = JSON.parse(readFileSync(join(opts.cwd, 'models.json'), 'utf8'));
+      const rows = Object.entries(providers).flatMap(([provider, value]: [string, any]) =>
+        (value.models ?? []).map((model: any) => `${provider} ${model.id} 128K 16K no no`));
+      cb(null, { stdout: ['provider model context max-out thinking images', ...rows].join('\n'), stderr: '' });
+    }) as typeof childProcess.execFile);
+    try {
+      const { createModelCatalog } = await vi.importActual<typeof import('../src/services/model-catalog.js')>('../src/services/model-catalog.js');
+      const catalogue = createModelCatalog();
+      detectModelsMock.mockImplementation((key: string, opts: any) => catalogue.detectModels(key, opts));
+      enableMenu('pi');
+      const bot = getBot(LARK_APP_ID) as any;
+      const unconfigured = mode === 'unpersisted HOME';
+      Object.assign(bot.config, { defaultWorkingDir: unconfigured ? undefined : botCwd, workingDir: unconfigured ? undefined : daemonCwd, backendType,
+        cliPathOverride: '/synthetic/pi', env: { PI_CODING_AGENT_DIR: 'relative-agent', HOME: injectedHome } });
+      bot.resolvedAllowedUsers = [OWNER];
+      const liveCwd = unconfigured ? home : mode === 'cold persisted' || mode === 'Bot fallback' ? undefined : sessionCwd;
+      const pinnedCwd = unconfigured || mode === 'Bot fallback' ? undefined : mode === 'explicit' ? sessionCwd : storedCwd;
+      const expected = unconfigured ? 'home-provider/shared' : mode === 'cold persisted' ? 'stored-provider/shared'
+        : mode === 'Bot fallback' ? 'bot-provider/shared' : 'session-provider/shared';
+      const defaultExpected = unconfigured ? 'home-provider/shared' : 'bot-provider/shared';
+      const sessionShape = { workingDir: liveCwd, sessionOverrides: { cliId: 'pi', workingDir: pinnedCwd, backendType } } as const;
+      const ds = makeDs(sessionShape);
+      const before = JSON.stringify(ds.session);
+      const deps = depsWith(ds, vi.fn(() => true));
+      expect((await sessionModelPickerData(ds)).models).toEqual([expected]);
+      expect((await defaultModelPickerData(LARK_APP_ID)).models).toEqual([defaultExpected]);
+      await handleCommand('/models', ROOT, { messageId: 'om_models', senderId: OWNER, content: '/models' } as any, deps, LARK_APP_ID);
+      const select = JSON.parse(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2]).elements.find((e: any) => e.tag === 'action').actions[0];
+      expect(select.options.map((option: any) => option.value)).toEqual([expected]);
+      const menu = await handleCardAction(menuData('model'), deps, LARK_APP_ID);
+      await menu.afterAck();
+      const replySelect = JSON.parse(deliverEphemeralOrReplyMock.mock.calls.at(-1)![2]).elements.find((e: any) => e.tag === 'action').actions[0];
+      expect(replySelect.options.map((option: any) => option.value)).toEqual([expected]);
+      expect(JSON.stringify(ds.session), 'menus do not persist HOME or cwd').toBe(before);
+      for (const action of ['reply_model_pick', 'session_model_pick']) {
+        const submissionDs = makeDs(sessionShape);
+        const submissionDeps = depsWith(submissionDs, vi.fn(() => true));
+        writeSessionModelPinMock.mockClear();
+        for (const provider of directories.map(item => item[1]!)) {
+          const slug = `${provider}/shared`;
+          if (slug === expected) continue;
+          const data = pickData(slug);
+          data.action.value.action = action;
+          expect((await handleCardAction(data, submissionDeps, LARK_APP_ID)).toast.type).toBe('warning');
+        }
+        expect(submissionDeps.deliverPassthroughCommand).not.toHaveBeenCalled();
+        expect(writeSessionModelPinMock).not.toHaveBeenCalled();
+        const accepted = pickData(expected);
+        accepted.action.value.action = action;
+        expect((await handleCardAction(accepted, submissionDeps, LARK_APP_ID)).toast.type).toBe('success');
+        expect(submissionDeps.deliverPassthroughCommand.mock.calls[0][1]).toBe(`/model ${expected}`);
+        expect(submissionDs.session.modelPin?.model).toBe(expected);
+      }
+      const top = depsWith(ds);
+      top.invocationContext = 'new-topic';
+      await handleCommand('/models', ROOT, { messageId: 'om_default', senderId: OWNER, content: '/models' } as any, top, LARK_APP_ID);
+      const defaultSelect = JSON.parse(top.sessionReply.mock.calls[0][1]).elements.find((e: any) => e.tag === 'action').actions[0];
+      expect(defaultSelect.options.map((option: any) => option.value)).toEqual(['__unset__', defaultExpected]);
+      // Adopted menus read the persisted session cwd without restarting the CLI.
+      const adopted = makeDs({ adoptedFrom: 'external', sessionOverrides: { cliId: 'pi', workingDir: sessionCwd, backendType } } as any);
+      expect((await sessionModelPickerData(adopted)).models).toEqual(['session-provider/shared']);
+    } finally {
+      execSpy.mockReset();
+      cwdSpy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(join(home, 'relative-agent'), { recursive: true, force: true });
+    }
+  });
+
+  it('keeps non-Pi shared pickers on session cwd and Bot defaults on their probe cwd', async () => {
+    enableMenu('traex');
+    const bot = getBot(LARK_APP_ID) as any;
+    bot.config.defaultWorkingDir = '/tmp/bot-picker-default';
+    detectModelsMock.mockImplementation((_key: string, opts: any) => Promise.resolve(
+      opts.probeCwd === '/tmp/live' ? ['session-model'] : ['bot-model']));
+    const ds = makeDs({ workingDir: '/tmp/live', sessionOverrides: { cliId: 'traex' } });
+    expect((await sessionModelPickerData(ds)).models).toEqual(['session-model']);
+    expect((await defaultModelPickerData(LARK_APP_ID)).models).toEqual(['bot-model']);
+    expect(readTraexModelLoadsMock.mock.calls.map(call => call[0].cwd)).toEqual(['/tmp/live', '/tmp/bot-picker-default']);
+    const data = pickData('session-model');
+    data.action.value.action = 'session_model_pick';
+    const deliver = vi.fn();
+    expect((await handleCardAction(data, depsWith(ds, deliver), LARK_APP_ID)).toast.type).toBe('success');
+    expect(deliver.mock.calls[0][1]).toBe('/model session-model');
+  });
+
   it('annotates every native model without changing the switch payload or losing zero and overload', async () => {
     enableMenu('traex');
     const models = ['GPT-5.4', 'GPT-6.1-Sol', 'Seed-Code'];
@@ -553,9 +904,9 @@ describe('/models shortcut', () => {
 
   it.each(['other-cli', 'wrapper', 'remote', 'changed-default'])('does not probe a host TraeX account for %s', async kind => {
     enableMenu(kind === 'changed-default' ? 'claude-code' : 'traex');
-    const ds = makeDs({ sessionOverrides: { cliId: kind === 'other-cli' ? 'claude-code' : 'traex',
-      ...(kind === 'wrapper' ? { wrapperCli: 'ttadk' } : {}),
-      ...(kind === 'remote' ? { backendType: 'remote-runner' } : {}) } });
+    const ds = makeDs({ ...(kind === 'remote' ? { initConfig: { backendType: 'remote-runner' } } : {}),
+      sessionOverrides: { cliId: kind === 'other-cli' ? 'claude-code' : 'traex',
+      ...(kind === 'wrapper' ? { wrapperCli: 'ttadk' } : {}) } });
     await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
     expect(readTraexModelLoadsMock.mock.calls.length).toBe(0);
   });
@@ -654,7 +1005,7 @@ describe('/models shortcut', () => {
 
   it('uses the session CLI after the bot defaults change', async () => {
     enableMenu('codex-app');
-    const ds = makeDs();
+    const ds = makeDs({ sessionOverrides: { agentFrozen: true } });
     await showSessionModelPicker(ds, ROOT, OWNER, undefined, vi.fn(async () => 'om_reply'), 'zh');
     expect(detectModelsMock).toHaveBeenCalledWith('claude-code', expect.anything());
     expect(deliverEphemeralOrReplyMock).toHaveBeenCalledTimes(1);

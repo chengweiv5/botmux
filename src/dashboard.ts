@@ -3916,6 +3916,27 @@ function loadBotConfigsSafe(): BotConfig[] {
   try { return loadBotConfigs(); } catch { return []; }
 }
 
+function resolveCliProbeBotConfig(appId: string | undefined):
+  | { ok: true; config: BotConfig | undefined }
+  | { ok: false; status: number; error: string } {
+  if (!appId) return { ok: true, config: undefined };
+  // The standalone Dashboard need not have an in-memory Bot registration.
+  // Keep the disk read outside that exception boundary so it can still run.
+  try {
+    const registered = getBot(appId).config;
+    if (registered) return { ok: true, config: registered };
+  } catch { /* not registered: use the persisted configuration */ }
+  try {
+    const persisted = loadBotConfigs().find(bot => bot.larkAppId === appId);
+    return persisted
+      ? { ok: true, config: persisted }
+      : { ok: false, status: 404, error: 'bot_not_found' };
+  } catch {
+    // An explicit target must not silently become an ambient CLI preview.
+    return { ok: false, status: 503, error: 'bot_config_unavailable' };
+  }
+}
+
 function botsReferencingPack(packId: string, bots: BotConfig[]): Array<{ larkAppId: string; botName: string }> {
   const selector = `pack:${packId}`;
   return bots
@@ -6195,13 +6216,9 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
       }
       const appId = url.searchParams.get('bot')?.trim();
-      let botConfig: BotConfig | undefined;
-      try {
-        botConfig = appId ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId) : undefined;
-      } catch {
-        botConfig = undefined;
-      }
-      const response = await cliAvailabilityResponse(key, botConfig, process.env);
+      const target = resolveCliProbeBotConfig(appId);
+      if (!target.ok) return jsonRes(res, target.status, { ok: false, error: target.error });
+      const response = await cliAvailabilityResponse(key, target.config, process.env);
       return jsonRes(res, response.statusCode, response.body);
     }
 
@@ -6215,18 +6232,13 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'unknown_selection_key' });
       }
       const appId = url.searchParams.get('bot')?.trim() || undefined;
-      let botConfig: BotConfig | undefined;
-      try {
-        botConfig = appId
-          ? getBot(appId).config ?? loadBotConfigs().find(bot => bot.larkAppId === appId)
-          : undefined;
-      } catch {
-        botConfig = undefined;
-      }
-      const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
+      const target = resolveCliProbeBotConfig(appId);
+      if (!target.ok) return jsonRes(res, target.status, { ok: false, error: target.error });
+      const probeContext = modelCatalogProbeContext(key, target.config, process.env);
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
+        probeCwd: probeContext.probeCwd,
         runtimeExecutable: probeContext.runtimeExecutable,
         adapterFactory: requestedCliId => createCliAdapterSync(
           requestedCliId,

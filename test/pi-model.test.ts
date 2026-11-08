@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -52,6 +52,12 @@ describe('pi model qualification', () => {
     const home = makeHome({ defaultProvider: 'team-gateway', defaultModel: 'grok-4.6' });
     expect(readPiDefaultProvider(home)).toBe('team-gateway');
     expect(piSettingsPath(home)).toBe(join(home, '.pi', 'agent', 'settings.json'));
+  });
+
+  it('expands a tilde agent directory against the target child HOME for qualification', () => {
+    const home = makeHome({ defaultProvider: 'target-provider' });
+    expect(resolvePiModel('shared', { env: { HOME: home, PI_CODING_AGENT_DIR: '~/.pi/agent' } }))
+      .toMatchObject({ kind: 'prefixed', flag: 'target-provider/shared' });
   });
 
   it('prefers PI_CODING_AGENT_DIR over ~/.pi (process env)', () => {
@@ -193,5 +199,31 @@ describe('pi model qualification', () => {
     expect(args[args.indexOf('--model') + 1]).toBe('team-gateway/grok-4.6');
     expect(infoSpy).toHaveBeenCalledTimes(1);
     expect(String(infoSpy.mock.calls[0][0])).toContain('team-gateway/grok-4.6');
+  });
+
+  it('qualifies against each actual session cwd rather than daemon cwd or Bot default', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pi-session-cwd-'));
+    try {
+      const daemon = join(root, 'daemon'), bot = join(root, 'bot'), topic = join(root, 'topic');
+      for (const [cwd, provider] of [[daemon, 'daemon-provider'], [bot, 'bot-provider'], [topic, 'topic-provider']]) {
+        mkdirSync(join(cwd!, 'relative-agent'), { recursive: true });
+        writeFileSync(join(cwd!, 'relative-agent', 'settings.json'), JSON.stringify({ defaultProvider: provider }));
+      }
+      vi.spyOn(process, 'cwd').mockReturnValue(daemon);
+      const env = { PI_CODING_AGENT_DIR: 'relative-agent' };
+      const adapter = createPiAdapter('/pi', () => '/tmp/boundary.js');
+      for (const [workingDir, provider] of [[bot, 'bot-provider'], [topic, 'topic-provider']]) {
+        expect(piSettingsPath({ env, cwd: workingDir })).toBe(join(workingDir!, 'relative-agent', 'settings.json'));
+        expect(resolvePiModelForSpawn('shared', env, workingDir)).toBe(`${provider}/shared`);
+        for (const resume of [false, true]) {
+          const args = adapter.buildArgs({ sessionId: 'relative-session', model: 'shared', env: { ...env }, workingDir, resume });
+          expect(args[args.indexOf('--model') + 1]).toBe(`${provider}/shared`);
+        }
+      }
+      const custom = adapter.buildArgs({ sessionId: 'custom', resume: false, model: 'custom-provider/custom', env, workingDir: topic });
+      expect(custom[custom.indexOf('--model') + 1]).toBe('custom-provider/custom');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

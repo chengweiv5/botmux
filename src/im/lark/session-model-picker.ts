@@ -15,7 +15,6 @@ import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.j
 import { canOperate } from './event-dispatcher.js';
 import { deliverEphemeralOrReply, isSessionTransferring, topicReasoningControl } from '../../core/worker-pool.js';
 import { readTraexModelLoads } from '../../services/traex-model-load.js';
-import { isRemoteBackendId } from '../../core/remote-cli-ids.js';
 
 export interface ModelPickerLoad {
   /** Missing entries and an unavailable query both mean unknown, never idle. */
@@ -25,21 +24,15 @@ export interface ModelPickerLoad {
 
 async function pickerLoad(key: string, cfg: BotConfig, session?: DaemonSession): Promise<ModelPickerLoad> {
   const unavailable = { loads: null, checkedAt: null };
-  // Only a native local TraeX catalogue advertises load metadata. Do not
-  // substitute a host account for a wrapper/remote/session-selected runtime.
-  const snapshot = session?.session.cliLaunchSnapshot;
-  if (key !== 'traex' || cfg.wrapperCli || cfg.cliLaunchMode
-    || session?.session.wrapperCli || session?.session.cliLaunchMode || snapshot?.wrapperCli || snapshot?.cliLaunchMode
-    || isRemoteBackendId(session?.session.backendType ?? cfg.backendType ?? 'pty')) return unavailable;
   try {
-    const probe = modelCatalogProbeContext(key, cfg, process.env);
-    if (!probe.runtimeContext) return unavailable;
-    const executable = snapshot?.cliRuntime?.executable ?? snapshot?.cliPathOverride
-      ?? session?.session.cliPathOverride ?? probe.runtimeExecutable;
+    const probe = modelCatalogProbeContext(key, cfg, process.env, session);
+    // Load metadata and catalogue discovery must address the same native local
+    // runtime, including a session that predates a Bot CLI/path edit.
+    if (probe.selectionKey !== 'traex' || !probe.canProbe || !probe.runtimeContext) return unavailable;
     const loads = await readTraexModelLoads({
-      cliBin: createCliAdapterSync('traex', executable ?? undefined).resolvedBin,
+      cliBin: createCliAdapterSync('traex', probe.runtimeExecutable).resolvedBin,
       env: probe.probeEnv,
-      cwd: session?.session.workingDir,
+      cwd: probe.probeCwd,
       timeoutMs: 2_500,
     });
     return { loads, checkedAt: loads ? Date.now() : null };
@@ -83,20 +76,22 @@ export const DEFAULT_MODEL_VALUE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(?
  * bare 'codex' key returns the native codex list instead of the gateway's.
  * Probe inputs (custom executable, injected env, runtime cache identity) are
  * derived through the same helper as the dashboard endpoint so the menu sees
- * exactly the runtime the session is running.
+ * exactly the runtime the session is running. The shared probe context resolves
+ * live/persisted session cwd and the worker-compatible unpinned default.
  */
-function resolveModelCatalogue(key: string, botConfig: BotConfig): {
+function resolveModelCatalogue(key: string, botConfig: BotConfig, session?: DaemonSession): {
   key: string;
   staticChoices: readonly string[];
   detect: () => Promise<readonly string[] | null>;
 } {
-  const probe = modelCatalogProbeContext(key, botConfig, process.env);
+  const probe = modelCatalogProbeContext(key, botConfig, process.env, session);
   return {
-    key,
-    staticChoices: staticModelChoices(key),
-    detect: () => detectModels(key, {
+    key: probe.selectionKey,
+    staticChoices: staticModelChoices(probe.selectionKey),
+    detect: () => !probe.canProbe ? Promise.resolve(null) : detectModels(probe.selectionKey, {
       runtimeContext: probe.runtimeContext,
       probeEnv: probe.probeEnv,
+      probeCwd: probe.probeCwd,
       runtimeExecutable: probe.runtimeExecutable,
       adapterFactory: requestedCliId => createCliAdapterSync(
         requestedCliId,
@@ -111,7 +106,7 @@ function resolveModelCatalogue(key: string, botConfig: BotConfig): {
  * this keeps the offered options and the inject whitelist on identical terms. */
 export async function sessionModelChoices(ds: DaemonSession): Promise<readonly string[]> {
   const key = selectionKeyForBot(sessionCliId(ds), ds.session.wrapperCli, ds.session.cliLaunchMode);
-  const catalogue = resolveModelCatalogue(key, getBot(ds.larkAppId).config);
+  const catalogue = resolveModelCatalogue(key, getBot(ds.larkAppId).config, ds);
   const live = await catalogue.detect().catch(() => null);
   return mergeModelChoices(catalogue.staticChoices, live).models;
 }

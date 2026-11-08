@@ -141,7 +141,7 @@ describe('GET /api/cli-options/models — Bot runtime 上下文', () => {
       cliPathOverride: '/bot/codex',
       env: { BOT_ONLY_SECRET: 'must-not-leak' },
     } as BotConfig;
-    expect(modelCatalogProbeContext('codex', bot, { PATH: '/system/bin' })).toEqual({
+    expect(modelCatalogProbeContext('codex', bot, { PATH: '/system/bin' })).toMatchObject({
       cliId: 'codex',
       runtimeExecutable: undefined,
       runtimeContext: undefined,

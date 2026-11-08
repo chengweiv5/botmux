@@ -9,6 +9,8 @@ import {
   type CliOptionsState,
 } from '../src/dashboard/web/bot-defaults.js';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+import { ModelPickerField } from '../src/dashboard/web/field-controls.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -111,6 +113,38 @@ describe('mergeModelCandidates', () => {
 
   it('detected 为空数组时回退 static（探测无结果，静态候选仍可用）', () => {
     expect(mergeModelCandidates(['a', 'b'], [])).toEqual(['a', 'b']);
+  });
+});
+
+describe('Pi model picker values', () => {
+  it.each(['shared', 'retired/custom', 'alpha/shared'])('keeps %s when the catalog hydrates and preserves custom entry', value => {
+    const onChange = vi.fn();
+    const props = { value, options: [] as string[], onChange, dataInput: 'pi-model',
+      ariaLabel: 'Pi model', defaultLabel: 'Default', customLabel: 'Custom' };
+    let renderer!: TestRenderer.ReactTestRenderer;
+    try {
+      act(() => { renderer = TestRenderer.create(React.createElement(ModelPickerField, props)); });
+      expect(renderer.root.findByType(DropdownMenu).props.options.map((o: { value: string }) => o.value)).toContain(value);
+      const models = ['alpha/shared', 'beta/shared', 'beta/other'];
+      act(() => { renderer.update(React.createElement(ModelPickerField, { ...props, options: models })); });
+      const dropdown = renderer.root.findByType(DropdownMenu);
+      const values = dropdown.props.options.map((o: { value: string }) => o.value);
+      expect(values).toEqual([...new Set([value, ...models]), values.at(-1)]);
+      expect(dropdown.props.value).toBe(value);
+      expect(onChange).not.toHaveBeenCalled();
+      act(() => { dropdown.props.onChange('beta/shared'); });
+      expect(onChange).toHaveBeenLastCalledWith('beta/shared');
+      onChange.mockClear();
+      act(() => { dropdown.props.onChange(values.at(-1)); });
+      expect(onChange).not.toHaveBeenCalled();
+      const input = renderer.root.findByProps({ type: 'text', 'data-input': 'pi-model' });
+      expect(input.props.value).toBe(value);
+      act(() => { input.props.onChange({ currentTarget: { value: 'new-provider/free-form' } }); });
+      expect(onChange).toHaveBeenLastCalledWith('new-provider/free-form');
+      expect(renderer.root.findAllByType('option').map(o => o.props.value)).toEqual(models);
+    } finally {
+      if (renderer) act(() => renderer.unmount());
+    }
   });
 });
 

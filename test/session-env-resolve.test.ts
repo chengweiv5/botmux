@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { BackendType } from '../src/adapters/backend/types.js';
 import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../src/core/env-policy.js';
 import { applyGlobalSessionEnvOps, invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
-import { botOneShotEnv, resolveSessionEnv, sessionEnvLockContextForBot, sessionNetworkPolicyEnvView } from '../src/core/session-env-resolve.js';
+import { botOneShotEnv, resolveSessionEnv, sessionEnvLockContextForBot, sessionNetworkPolicyEnvView, sessionOneShotProbeEnv } from '../src/core/session-env-resolve.js';
 import { emptyEnvLayer } from '../src/core/session-env.js';
 import { readSessionEnvStamp, sessionEnvFingerprint, writeSessionEnvStamp } from '../src/services/session-env-stamp.js';
 
@@ -134,6 +134,53 @@ describe('resolveSessionEnv', () => {
     expect(sessionEnvLockContextForBot({})).toEqual({ identityShell: true, identityGit: false });
     expect(sessionEnvLockContextForBot({ apiOnly: true })).toEqual({ identityShell: false, identityGit: false });
     expect(sessionEnvLockContextForBot({ backendType: 'riff' })).toEqual({ identityShell: false, identityGit: false });
+  });
+});
+
+describe('session model probe environment', () => {
+  it.each([false, true].flatMap(skipBotSet => [false, true].map(strict => ({ skipBotSet, strict }))))(
+    'preserves layers, removals and inherited policy (skip=$skipBotSet, strict=$strict)', ({ skipBotSet, strict }) => {
+      const input = { bot: { env: { SOURCE: 'bot' }, envUnset: ['REMOVED'],
+        envPolicy: strict ? { mode: 'strict' as const, inherit: ['GRANTED'] } : undefined },
+      backendType: 'tmux' as const, skipBotSet, global: { set: { SOURCE: 'global' }, unset: ['GLOBAL_REMOVED'] } };
+      const base = { PATH: '/usr/bin', HOME: dir, GRANTED: 'keep', OTHER: 'ambient', REMOVED: 'gone', GLOBAL_REMOVED: 'gone' };
+      const before = JSON.stringify({ input, base });
+      const probe = sessionOneShotProbeEnv(base, input);
+      expect(probe.env.SOURCE).toBe(skipBotSet ? 'global' : 'bot');
+      expect(probe.env.GRANTED).toBe('keep');
+      expect(probe.env.OTHER).toBe(strict ? undefined : 'ambient');
+      expect(probe.env.REMOVED).toBeUndefined();
+      expect(probe.env.GLOBAL_REMOVED).toBeUndefined();
+      expect(probe.fingerprint).toBe(resolveSessionEnv(input).fingerprint);
+      expect(JSON.stringify({ input, base })).toBe(before);
+    },
+  );
+
+  it.each([false, true].flatMap(larkBindingOff => [false, true].map(trigger => ({ larkBindingOff, trigger }))))(
+    'uses session identity lock facts without running wrappers (off=$larkBindingOff, trigger=$trigger)', ({ larkBindingOff, trigger }) => {
+      const env = { ZDOTDIR: '/synthetic/zsh', BASH_ENV: '/synthetic/bash', GIT_CONFIG_COUNT: '1', OTHER: 'keep' };
+      const bot = { env, triggerUserAuth: { enabled: trigger } };
+      const probe = sessionOneShotProbeEnv({}, { bot, backendType: 'pty', facts: { larkBindingOff }, global: emptyEnvLayer() });
+      expect(probe.env.ZDOTDIR).toBe(larkBindingOff && !trigger ? env.ZDOTDIR : undefined);
+      expect(probe.env.BASH_ENV).toBe(larkBindingOff && !trigger ? env.BASH_ENV : undefined);
+      expect(probe.env.GIT_CONFIG_COUNT).toBe(trigger ? undefined : '1');
+      expect(probe.env.OTHER).toBe('keep');
+      expect(botOneShotEnv({}, bot).ZDOTDIR).toBe(env.ZDOTDIR);
+    },
+  );
+
+  it('removes protected ambient, set and unset channels without exposing their values or changing inputs', () => {
+    const policy = { capabilities: [], protectedHomePaths: [], redactEnv: ['PRIVATE_AUTH', 'PRIVATE_REMOVAL'] };
+    const input = { bot: { env: { PRIVATE_AUTH: 'synthetic-secret', PUBLIC_MODEL: 'visible' }, envUnset: ['PRIVATE_REMOVAL'] },
+      backendType: 'pty' as const, global: emptyEnvLayer() };
+    const base = { HOME: dir, PRIVATE_AUTH: 'ambient-secret', PRIVATE_REMOVAL: 'ambient' };
+    const before = JSON.stringify({ input, base, policy });
+    const probe = sessionOneShotProbeEnv(base, input, policy);
+    expect(probe.env.PRIVATE_AUTH).toBeUndefined();
+    expect(probe.env.PRIVATE_REMOVAL).toBeUndefined();
+    expect(probe.env.PUBLIC_MODEL).toBe('visible');
+    expect(probe.fingerprint).toBe(sessionEnvFingerprint({ set: { PUBLIC_MODEL: 'visible' }, unset: [] }));
+    expect(JSON.stringify({ input, base, policy })).toBe(before);
   });
 });
 

@@ -27,6 +27,7 @@ import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { detectAidenCodexModels } from './aiden-model-catalog.js';
 import { createHash } from 'node:crypto';
 import { realpathSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { isCodexReasoningEffort, reasoningEffortsForCliModel } from './codex-reasoning-effort.js';
 
 export type ModelSource = 'static' | 'live';
@@ -46,6 +47,8 @@ export interface DetectModelsOptions {
   readonly runtimeContext?: string;
   /** Bot-specific environment for a capability probe. */
   readonly probeEnv?: NodeJS.ProcessEnv;
+  /** Effective target process cwd; relative config paths and cache identity use it. */
+  readonly probeCwd?: string;
   /** Trusted executable selected from the target Bot's persisted native runtime. */
   readonly runtimeExecutable?: string;
   /** Command resolver injection for deterministic cache-identity tests. */
@@ -158,18 +161,18 @@ async function detectModelCatalogWith(
       && !adapter?.detectModels) return null;
 
     // TTL 内的成功缓存直接复用。
-    const envKey = opts?.probeEnv
-      ? createHash('sha256').update(JSON.stringify(
-        Object.keys(opts.probeEnv).sort().map(key => [key, opts.probeEnv![key]]),
-      )).digest('hex')
-      : '';
+    const probeEnv = opts?.probeEnv ?? process.env;
+    const probeCwd = resolve(opts?.probeCwd ?? process.cwd());
+    const envKey = createHash('sha256').update(JSON.stringify(
+      Object.keys(probeEnv).sort().map(key => [key, probeEnv[key]]),
+    )).digest('hex');
     const runtimeIdentity = opt.key === 'aiden-x-codex'
       ? 'aiden'
       : runtimeCacheIdentity(
           opts?.runtimeExecutable ?? rawCliExecutable(opt.cliId),
           opts?.resolveExecutable ?? resolveCommand,
         );
-    const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}`;
+    const cacheKey = `${opt.key}\0${opts?.runtimeContext ?? ''}\0${envKey}\0${runtimeIdentity}\0${probeCwd}`;
     const cached = cache.get(cacheKey);
     if (cached && now() - cached.at < MODEL_DETECT_TTL_MS) {
       return { models: cached.models, ...(cached.modelCapabilities ? { modelCapabilities: cached.modelCapabilities } : {}) };
@@ -182,13 +185,13 @@ async function detectModelCatalogWith(
     const promise = (async (): Promise<DetectedModelCatalog | null> => {
       try {
         const capabilities = adapter?.detectModelCapabilities
-          ? await adapter.detectModelCapabilities({ env: opts?.probeEnv })
+          ? await adapter.detectModelCapabilities({ env: probeEnv, cwd: probeCwd })
           : undefined;
         const models = opt.key === 'aiden-x-codex'
           ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
           : adapter?.detectModelCapabilities
             ? capabilities?.map(model => model.slug) ?? null
-            : await adapter?.detectModels?.() ?? null;
+            : await adapter?.detectModels?.({ env: probeEnv, cwd: probeCwd }) ?? null;
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models === null) return null;
         if (models.length === 0) return { models: [] };

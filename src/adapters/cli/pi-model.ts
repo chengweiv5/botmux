@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 export type PiModelLookup = {
   homeDir?: string;
@@ -13,6 +13,8 @@ export type PiModelLookup = {
    * config env, per-sender identity isolation, CLI data-dir redirects).
    */
   env?: NodeJS.ProcessEnv;
+  /** Actual Pi process cwd, not the daemon or Dashboard cwd. */
+  cwd?: string;
 };
 
 /** Pi accepts `--model provider/id`. A slash already pins the provider. */
@@ -31,9 +33,13 @@ export function piSettingsPath(lookup: PiModelLookup | string = {}): string {
   // Pi derives the same variable name from its package name (PI_CODING_AGENT_DIR
   // for stock pi, TAU_CODING_AGENT_DIR for re-skinned builds).
   const overlay = env.PI_CODING_AGENT_DIR?.trim();
-  if (overlay) return join(overlay, 'settings.json');
   const configuredHome = env.HOME?.trim();
   const home = lookup.homeDir ?? configuredHome ?? homedir();
+  if (overlay) {
+    const expanded = overlay === '~' ? home
+      : overlay.startsWith('~/') ? join(home, overlay.slice(2)) : overlay;
+    return join(resolve(lookup.cwd ?? process.cwd(), expanded), 'settings.json');
+  }
   return join(home, '.pi', 'agent', 'settings.json');
 }
 
